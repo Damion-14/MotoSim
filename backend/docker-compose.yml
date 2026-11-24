@@ -1,0 +1,25 @@
+services:
+  motosim-backend:
+    container_name: motosim-backend
+    build: .
+    restart: always
+    env_file: ${MOTOSIM_ENV_FILE:-.env}
+    read_only: true
+    volumes:
+      - motosim-tracks:/data/tracks
+    tmpfs:
+      - /tmp:size=160m,mode=1777
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    external: true
+
+volumes:
+  motosim-tracks:
