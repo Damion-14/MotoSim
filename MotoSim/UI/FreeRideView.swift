@@ -3,8 +3,13 @@ import SwiftUI
 struct FreeRideView: View {
     @ObservedObject var session: FreeRideSession
     let track: Track
-    @AppStorage("online.trackServer") private var serverAddress = ""
+    @AppStorage("online.trackServer") private var serverAddress = TrackTransfer.defaultServerAddress
+    @AppStorage("online.riderName") private var riderName = ""
     @State private var uploadKey = ""
+    @State private var joinCode = ""
+
+    private var validServer: Bool { TrackTransfer.serverURL(serverAddress) != nil }
+    private var normalizedCode: String { joinCode.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     var body: some View {
         NavigationStack {
@@ -14,50 +19,57 @@ struct FreeRideView: View {
                 }
                 switch session.phase {
                 case .idle:
-                    if session.signedIn {
-                        Section {
-                            LabeledContent("Track", value: track.name)
-                            if track.heightField != nil {
-                                TextField("Track server HTTPS address", text: $serverAddress)
-                                    .textContentType(.URL)
-                                    .keyboardType(.URL)
-                                    .textInputAutocapitalization(.never)
-                                    .autocorrectionDisabled()
-                                SecureField("Host upload key", text: $uploadKey)
-                                    .textInputAutocapitalization(.never)
-                                    .autocorrectionDisabled()
-                            }
-                            Button("Host Free Ride") {
-                                session.host(track: track, serverAddress: serverAddress,
-                                             uploadKey: uploadKey.trimmingCharacters(in: .whitespacesAndNewlines))
-                            }
-                            .disabled(track.heightField != nil &&
-                                      (TrackTransfer.serverURL(serverAddress) == nil || uploadKey.utf8.count < 32))
-                        } footer: {
-                            if track.heightField != nil {
-                                Text("Hosting uploads a temporary copy. Invited riders get the track automatically.")
-                            }
+                    Section {
+                        TextField("Server HTTPS address", text: $serverAddress)
+                            .textContentType(.URL)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        TextField("Rider name", text: $riderName, prompt: Text("Rider"))
+                            .textContentType(.nickname)
+                    }
+                    Section("Host") {
+                        LabeledContent("Track", value: track.name)
+                        if track.heightField != nil {
+                            SecureField("Host upload key", text: $uploadKey)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
                         }
-                        Section("Join Invite") {
-                            Text("Open a Game Center invitation from your friend to join their Free Ride.")
+                        Button("Host Free Ride") {
+                            session.host(track: track, serverAddress: serverAddress,
+                                         uploadKey: uploadKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                                         name: riderName)
                         }
-                    } else {
-                        Section {
-                            Button("Sign In to Game Center", action: session.signIn)
-                        } footer: {
-                            Text("Game Center connects you with invited riders.")
+                        .disabled(!validServer || (track.heightField != nil && uploadKey.utf8.count < 32))
+                    }
+                    Section("Join") {
+                        TextField("8-character room code", text: $joinCode)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .font(.system(.body, design: .monospaced))
+                        Button("Join Free Ride") {
+                            session.join(code: normalizedCode, serverAddress: serverAddress, name: riderName)
+                        }
+                        .disabled(!validServer || !FreeRideSession.validCode(normalizedCode))
+                    }
+                case .preparing, .connecting:
+                    ProgressView(session.phase == .preparing ? "Uploading track…" : "Connecting to Free Ride…")
+                    Button("Cancel", role: .cancel) { session.leave() }
+                case .lobby, .riding:
+                    if session.isHost && session.phase == .lobby {
+                        Section("Invite Riders") {
+                            LabeledContent("Room code") {
+                                Text(session.roomCode)
+                                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                                    .textSelection(.enabled)
+                            }
+                            ShareLink(item: "Join my MotoSim Free Ride with code \(session.roomCode) on \(serverAddress).")
                         }
                     }
-                case .preparing:
-                    ProgressView("Uploading track…")
-                    Button("Cancel", role: .cancel) { session.leave() }
-                case .inviting:
-                    ProgressView("Connecting to Game Center…")
-                case .lobby, .riding:
                     Section("Riders") {
                         ForEach(session.riders) { rider in
                             LabeledContent(rider.name, value: session.phase == .riding && rider.status == .ready
-                                           ? "Riding" : rider.status.rawValue)
+                                           ? "Riding" : rider.status.label)
                         }
                     }
                     if session.phase == .lobby {
@@ -87,6 +99,11 @@ struct FreeRideView: View {
                         Button("Done") { session.showLobby = false }
                     }
                 }
+            }
+        }
+        .onAppear {
+            if serverAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                serverAddress = TrackTransfer.defaultServerAddress
             }
         }
         .tint(.orange)

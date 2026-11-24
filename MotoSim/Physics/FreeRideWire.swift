@@ -7,32 +7,28 @@ struct TrackDownload: Codable, Equatable, Sendable {
     let sha256: String
 }
 
-struct RideManifest: Codable {
-    let trackVersion: Int
-    let name: String
-    let download: TrackDownload?
-    let start: SIMD2<Float>
+struct RideStart {
+    let position: SIMD2<Float>
     let heading: Float
-    let roster: [String]
 
-    func placed(_ input: Track, rider: String) throws -> Track {
-        guard let slot = roster.firstIndex(of: rider), slot < 4, heading.isFinite, abs(heading) < 100,
-              start.x.isFinite, start.y.isFinite, input.contains([start.x, 0, start.y]) else {
+    func placed(_ input: Track, slot: Int) throws -> Track {
+        guard (0..<4).contains(slot), heading.isFinite, abs(heading) < 100,
+              position.x.isFinite, position.y.isFinite, input.contains([position.x, 0, position.y]) else {
             throw SharedTrack.Failure.invalid
         }
         let forward = SIMD2<Float>(sin(heading), cos(heading))
         let right = SIMD2<Float>(-forward.y, forward.x)
         let offsets: [SIMD2<Float>] = [.zero, right * 1.15, -forward * 1.5, right * 1.15 - forward * 1.5]
         let half = input.halfExtents
-        var origin = start
+        var origin = position
         for axis in 0..<2 {
             let edges = offsets.map { $0[axis] }
             origin[axis] = min(half[axis] - 0.15 - (edges.max() ?? 0),
                                max(-half[axis] + 0.15 - (edges.min() ?? 0), origin[axis]))
         }
-        let position = origin + offsets[slot]
+        let start = origin + offsets[slot]
         var track = input
-        track.startPosition = [position.x, 0, position.y]
+        track.startPosition = [start.x, 0, start.y]
         track.startHeading = heading
         return track
     }

@@ -39,7 +39,6 @@ struct RideView: View {
         .task {
             game.freeRide = freeRide
             freeRide.currentTrack = { [weak game] in game?.track ?? Track() }
-            freeRide.configure()
         }
         .task(id: loadAttempt) { await game.loadTrack() }
         .ignoresSafeArea()
@@ -71,20 +70,6 @@ struct RideView: View {
         }
         .onChange(of: freeRide.phase) { _, phase in
             switch phase {
-            case .lobby where !freeRide.showLobby:
-                let closingSheet = pickingTrack || startSelection != nil || showingSetup || importError != nil
-                pickingTrack = false
-                startSelection = nil
-                showingSetup = false
-                importError = nil
-                if closingSheet {
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(400))
-                        if freeRide.phase == .lobby { freeRide.showLobby = true }
-                    }
-                } else {
-                    freeRide.showLobby = true
-                }
             case .riding:
                 freeRide.showLobby = false
             case .idle:

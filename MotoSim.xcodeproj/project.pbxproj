@@ -70,15 +70,6 @@
 		100000000000000000000001 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
-				TargetAttributes = {
-					100000000000000000000005 = {
-						SystemCapabilities = {
-							com.apple.GameCenter = {
-								enabled = 1;
-							};
-						};
-					};
-				};
 			};
 			buildConfigurationList = 10000000000000000000000A /* Build configuration list for PBXProject "MotoSim" */;
 			compatibilityVersion = "Xcode 16.0";
@@ -149,8 +140,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 356N8W782U;
 				GENERATE_INFOPLIST_FILE = YES;
-				CODE_SIGN_ENTITLEMENTS = MotoSim.entitlements;
 				INFOPLIST_FILE = "MotoSim-Info.plist";
+				MOTOSIM_SERVER_URL = "https://motosim.damedoll.com";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				MARKETING_VERSION = 0.1.0;
@@ -167,8 +158,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 356N8W782U;
 				GENERATE_INFOPLIST_FILE = YES;
-				CODE_SIGN_ENTITLEMENTS = MotoSim.entitlements;
 				INFOPLIST_FILE = "MotoSim-Info.plist";
+				MOTOSIM_SERVER_URL = "https://motosim.damedoll.com";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				MARKETING_VERSION = 0.1.0;

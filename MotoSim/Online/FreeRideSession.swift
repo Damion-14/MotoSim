@@ -1,145 +1,140 @@
 import Combine
 import Foundation
-@preconcurrency import GameKit
-import UIKit
 
-private enum RideMessage: Codable {
-    case hello
-    case setup(RideManifest)
-    case status(FreeRideSession.LoadStatus)
-    case start
-    case end
-    case reset(RideSnapshot)
-    case movement(RideSnapshot)
+private struct RoomTrack: Codable {
+    let version: Int
+    let name: String
+    let grant: String?
+    let sha256: String?
+    let start: SIMD2<Float>
+    let heading: Float
 }
 
-private struct RidePacket: Codable {
-    let version: Int
-    let message: RideMessage
+private struct RoomCommand: Encodable {
+    var version = 1
+    let type: String
+    var code: String?
+    var name: String?
+    var token: String?
+    var status: String?
+    var track: RoomTrack?
+    var pose: RideSnapshot?
+}
+
+private struct RoomEvent: Decodable {
+    let type: String
+    let code: String?
+    let token: String?
+    let id: String?
+    let slot: Int?
+    let track: RoomTrack?
+    let riders: [FreeRideSession.Rider]?
+    let active: Bool?
+    let pose: RideSnapshot?
+    let notice: String?
 }
 
 @MainActor
-final class FreeRideSession: NSObject, ObservableObject {
+final class FreeRideSession: ObservableObject {
     enum LoadStatus: String, Codable {
-        case connecting = "Connecting"
-        case downloading = "Checking or downloading track"
-        case loading = "Loading terrain"
-        case ready = "Ready"
-        case failed = "Track could not load"
-        case disconnected = "Disconnected"
+        case downloading, loading, ready, failed, reconnecting
+
+        var label: String {
+            switch self {
+            case .downloading: "Checking or downloading track"
+            case .loading: "Loading terrain"
+            case .ready: "Ready"
+            case .failed: "Track could not load"
+            case .reconnecting: "Reconnecting"
+            }
+        }
     }
 
-    struct Rider: Identifiable {
+    struct Rider: Identifiable, Decodable {
         let id: String
         let name: String
-        var status: LoadStatus
+        let status: LoadStatus
     }
 
     enum Phase: Equatable {
-        case idle, preparing, inviting, lobby, riding
+        case idle, preparing, connecting, lobby, riding
     }
 
     @Published private(set) var phase = Phase.idle
-    @Published private(set) var signedIn = false
     @Published private(set) var isHost = false
     @Published private(set) var riders: [Rider] = []
     @Published private(set) var notice: String?
+    @Published private(set) var roomCode = ""
+    @Published private(set) var connected = false
     @Published var showLobby = false
     @Published private(set) var trackRequest = 0
 
     private(set) var pendingTrack: Track?
     var currentTrack: (() -> Track)?
-    private var configured = false
-    private var authenticationView: UIViewController?
-    private weak var matchmaker: GKMatchmakerViewController?
-    private var match: GKMatch?
-    private var manifest: RideManifest?
-    private var hostID: String?
     private var hostedTrack: Track?
-    private var hostedDownload: TrackDownload?
+    private var roomTrack: RoomTrack?
+    private var server: URL?
+    private var localID: String?
+    private var slot = 0
+    private var resumeToken: String?
+    private var localStatus: LoadStatus = .loading
+    private var sessionID = UUID()
+    private var socket: URLSessionWebSocketTask?
+    private var lastServerEvent: TimeInterval = 0
+    private var connectionTask: Task<Void, Never>?
     private var transfer: Task<Void, Never>?
-    private var heartbeat: Task<Void, Never>?
-    private var removalTasks: [String: Task<Void, Never>] = [:]
     private var motions: [String: RemoteBikeMotion] = [:]
     private var sequence: UInt32 = 0
     private var generation: UInt32 = 0
     private var nextSendAt: TimeInterval = 0
-    private var resetPending = false
-    private var localID: String { GKLocalPlayer.local.gamePlayerID }
-    private static let protocolVersion = 1
-    private static let maxPacketBytes = 8192
+    private var movementTask: Task<Void, Never>?
 
     var canStart: Bool {
-        isHost && phase == .lobby && riders.count >= 2 && riders.allSatisfy { $0.status == .ready }
+        connected && isHost && phase == .lobby && riders.count >= 2 && riders.allSatisfy { $0.status == .ready }
     }
 
     var blocksRiding: Bool { phase == .lobby }
-    var canRetryTrack: Bool {
-        phase == .lobby && (pendingTrack != nil || manifest != nil) &&
-            riders.first { $0.id == localID }?.status == .failed
+    var canRetryTrack: Bool { phase == .lobby && roomTrack != nil && localStatus == .failed }
+
+    static func validCode(_ code: String) -> Bool {
+        code.utf8.count == 8 && code.uppercased().utf8.allSatisfy { (48...57).contains($0) || (65...70).contains($0) }
     }
 
-    func configure() {
-        guard !configured else { return }
-        configured = true
-        GKLocalPlayer.local.register(self)
-        GKLocalPlayer.local.authenticateHandler = { [weak self] controller, _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.signedIn = GKLocalPlayer.local.isAuthenticated
-                self.authenticationView = controller
-                if !self.signedIn && self.match != nil { self.leave(reason: "Game Center signed out.") }
-            }
-        }
-    }
-
-    func signIn() {
-        if let authenticationView {
-            presenter()?.present(authenticationView, animated: true)
-        } else if !signedIn {
-            notice = "Sign in to Game Center in iPhone Settings, then reopen MotoSim."
-        }
-    }
-
-    func host(track: Track, serverAddress: String, uploadKey: String) {
-        guard phase == .idle, signedIn else { return }
-        guard !GKLocalPlayer.local.isMultiplayerGamingRestricted else {
-            notice = "This Game Center account is restricted from multiplayer."
-            return
-        }
+    func host(track: Track, serverAddress: String, uploadKey: String, name: String) {
+        guard phase == .idle, let server = TrackTransfer.serverURL(serverAddress) else { return }
         notice = nil
         isHost = true
-        phase = .preparing
+        self.server = server
         hostedTrack = track
+        phase = track.heightField == nil ? .connecting : .preparing
+        let id = sessionID
         transfer = Task {
             do {
+                var download: TrackDownload?
                 if track.heightField != nil {
-                    guard let url = TrackTransfer.serverURL(serverAddress), uploadKey.utf8.count >= 32 else {
-                        throw TrackTransfer.Failure.configuration
-                    }
-                    let download = try await TrackTransfer.upload(track, server: url, key: uploadKey)
-                    try Task.checkCancellation()
-                    hostedDownload = download
+                    download = try await TrackTransfer.upload(track, server: server, key: uploadKey)
                 }
                 try Task.checkCancellation()
-                let request = GKMatchRequest()
-                request.minPlayers = 2
-                request.maxPlayers = 4
-                guard let controller = GKMatchmakerViewController(matchRequest: request) else {
-                    leave(reason: "Game Center could not open the invitation screen.")
-                    return
-                }
-                controller.matchmakingMode = .inviteOnly
-                presentMatchmaker(controller)
+                guard sessionID == id else { return }
+                let config = RoomTrack(version: SharedTrack.version, name: String(track.name.prefix(100)),
+                                       grant: download?.grant, sha256: download?.sha256,
+                                       start: [track.startPosition.x, track.startPosition.z], heading: track.startHeading)
+                connect(RoomCommand(type: "host", name: name, track: config), server: server)
             } catch {
-                if !Task.isCancelled { leave(reason: error.localizedDescription) }
+                if sessionID == id && !Task.isCancelled { finish(reason: error.localizedDescription) }
             }
         }
+    }
+
+    func join(code: String, serverAddress: String, name: String) {
+        guard phase == .idle, Self.validCode(code), let server = TrackTransfer.serverURL(serverAddress) else { return }
+        notice = nil
+        self.server = server
+        connect(RoomCommand(type: "join", code: code.uppercased(), name: name), server: server)
     }
 
     func startRide() {
-        guard canStart, send(.start) else { return }
-        phase = .riding
+        if canStart { send(RoomCommand(type: "start")) }
     }
 
     func terrainReady() {
@@ -155,324 +150,237 @@ final class FreeRideSession: NSObject, ObservableObject {
     }
 
     func retryTrack() {
-        guard canRetryTrack, let manifest else { return }
-        pendingTrack = nil
-        prepareTrack(manifest)
+        if canRetryTrack { prepareTrack() }
     }
 
-    func leave(reason: String? = nil) {
-        if isHost { _ = send(.end) }
-        matchmaker?.dismiss(animated: true)
-        matchmaker = nil
-        match?.delegate = nil
-        match?.disconnect()
-        match = nil
-        heartbeat?.cancel()
-        heartbeat = nil
-        transfer?.cancel()
-        transfer = nil
-        for task in removalTasks.values { task.cancel() }
-        removalTasks.removeAll()
-        motions.removeAll()
-        riders.removeAll()
-        pendingTrack = nil
-        hostedTrack = nil
-        hostedDownload = nil
-        hostID = nil
-        manifest = nil
-        isHost = false
-        phase = .idle
-        sequence = 0
-        generation = 0
-        nextSendAt = 0
-        resetPending = false
-        notice = reason
-        if reason != nil { showLobby = true }
+    func leave() {
+        let previous = socket
+        let runner = connectionTask
+        if connected, let previous {
+            // Give the leave message a chance to reach the server before closing the socket.
+            Task {
+                try? await Self.send(RoomCommand(type: "leave"), over: previous)
+                previous.cancel(with: .normalClosure, reason: nil)
+                runner?.cancel()
+            }
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                previous.cancel(with: .normalClosure, reason: nil)
+                runner?.cancel()
+            }
+            socket = nil
+            connectionTask = nil
+        }
+        finish()
     }
 
     func respawned() {
-        guard phase == .riding else { return }
-        generation &+= 1
-        resetPending = true
+        if phase == .riding { generation &+= 1 }
     }
 
     func sendPose(_ pose: BikeState, at time: TimeInterval) {
-        guard phase == .riding, resetPending || time >= nextSendAt else { return }
+        guard phase == .riding, connected, time >= nextSendAt, movementTask == nil, let socket else { return }
         sequence &+= 1
-        let snapshot = RideSnapshot(pose, sequence: sequence, generation: generation)
-        if resetPending {
-            resetPending = !send(.reset(snapshot), mode: .reliable, reportError: false)
-        } else {
-            _ = send(.movement(snapshot), mode: .unreliable, reportError: false)
-        }
         nextSendAt = max(nextSendAt + 0.05, time + 0.025)
+        let packet = RoomCommand(type: "pose", pose: RideSnapshot(pose, sequence: sequence, generation: generation))
+        let id = sessionID
+        movementTask = Task {
+            defer { if id == sessionID && socket === self.socket { movementTask = nil } }
+            do { try await Self.send(packet, over: socket) }
+            catch { socket.cancel(with: .goingAway, reason: nil) }
+        }
     }
 
     func remotePoses(at time: TimeInterval) -> [String: BikeState] {
-        guard phase == .riding else { return [:] }
-        return motions.compactMapValues { $0.pose(at: time) }
+        phase == .riding ? motions.compactMapValues { $0.pose(at: time) } : [:]
     }
 
-    private func presenter() -> UIViewController? {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
-        var controller = scene?.keyWindow?.rootViewController
-        while let presented = controller?.presentedViewController, !presented.isBeingDismissed {
-            controller = presented
-        }
-        return controller
-    }
-
-    private func presentMatchmaker(_ controller: GKMatchmakerViewController) {
-        guard let presenter = presenter() else {
-            leave(reason: "The invitation screen is unavailable. Open Free Ride and try again.")
-            return
-        }
-        phase = .inviting
-        matchmaker = controller
-        controller.matchmakerDelegate = self
-        presenter.present(controller, animated: true)
-    }
-
-    private func begin(_ match: GKMatch) {
-        self.match = match
-        match.delegate = self
-        phase = .lobby
-        refreshRiders()
-        heartbeat = Task {
-            let started = ProcessInfo.processInfo.systemUptime
-            while !Task.isCancelled && phase == .lobby {
-                if isHost && manifest == nil && match.expectedPlayerCount == 0 && match.players.count >= 1 {
-                    createManifest(match)
-                } else if !isHost && manifest == nil {
-                    _ = send(.hello, reportError: false)
+    private func connect(_ initial: RoomCommand, server: URL) {
+        guard var address = URLComponents(url: server.appending(path: "v1/rooms/connect"), resolvingAgainstBaseURL: false) else { return }
+        address.scheme = "wss"
+        guard let url = address.url else { return }
+        phase = .connecting
+        let id = sessionID
+        connectionTask = Task {
+            var request = initial
+            var retryUntil: TimeInterval?
+            while !Task.isCancelled && sessionID == id {
+                let connection = URLSession.shared.webSocketTask(with: url)
+                connection.maximumMessageSize = 8192
+                socket = connection
+                connection.resume()
+                lastServerEvent = ProcessInfo.processInfo.systemUptime
+                let watchdog = Task {
+                    while !Task.isCancelled {
+                        do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                        guard socket === connection else { return }
+                        if ProcessInfo.processInfo.systemUptime - lastServerEvent >= 20 {
+                            connection.cancel(with: .goingAway, reason: nil)
+                            return
+                        }
+                    }
                 }
-                if let status = riders.first(where: { $0.id == localID })?.status, manifest != nil {
-                    _ = send(.status(status), reportError: false)
+                defer { watchdog.cancel() }
+                do {
+                    try await Self.send(request, over: connection)
+                    while !Task.isCancelled && sessionID == id {
+                        let message = try await connection.receive()
+                        lastServerEvent = ProcessInfo.processInfo.systemUptime
+                        guard sessionID == id else { break }
+                        guard case .string(let text) = message else { continue }
+                        let event = try JSONDecoder().decode(RoomEvent.self, from: Data(text.utf8))
+                        if event.type == "welcome" { retryUntil = nil }
+                        receive(event)
+                    }
+                } catch {
+                    guard !Task.isCancelled, sessionID == id else { return }
+                    connection.cancel(with: .goingAway, reason: nil)
+                    socket = nil
+                    movementTask?.cancel()
+                    movementTask = nil
+                    connected = false
+                    guard let resumeToken else {
+                        finish(reason: "Could not connect to the Free Ride server. \(error.localizedDescription)")
+                        return
+                    }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let cutoff = retryUntil ?? now + 25
+                    retryUntil = cutoff
+                    guard now < cutoff else {
+                        finish(reason: "The connection expired. Join a new Free Ride to continue online.")
+                        return
+                    }
+                    notice = "Connection lost. Reconnecting…"
+                    request = RoomCommand(type: "resume", code: roomCode, token: resumeToken)
+                    try? await Task.sleep(for: .seconds(1))
                 }
-                if manifest == nil && ProcessInfo.processInfo.systemUptime - started > 45 {
-                    leave(reason: "The Free Ride invitation did not finish connecting. Try again.")
-                    return
-                }
-                try? await Task.sleep(for: .seconds(1))
             }
         }
     }
 
-    private func createManifest(_ match: GKMatch) {
-        guard let hostedTrack else { return }
-        let roster = [localID] + match.players.map(\.gamePlayerID).sorted()
-        let config = RideManifest(trackVersion: SharedTrack.version, name: String(hostedTrack.name.prefix(100)),
-                                  download: hostedDownload,
-                                  start: [hostedTrack.startPosition.x, hostedTrack.startPosition.z],
-                                  heading: hostedTrack.startHeading, roster: roster)
-        manifest = config
-        _ = send(.setup(config))
-        prepareTrack(config)
+    private func receive(_ event: RoomEvent) {
+        switch event.type {
+        case "welcome":
+            guard let id = event.id, let code = event.code, let token = event.token, let info = event.track,
+                  info.version == SharedTrack.version else {
+                finish(reason: "This Free Ride uses an incompatible track format.")
+                return
+            }
+            let resuming = resumeToken != nil
+            localID = id
+            roomCode = code
+            resumeToken = token
+            roomTrack = info
+            slot = event.slot ?? 0
+            connected = true
+            notice = nil
+            setRoster(event.riders ?? [])
+            phase = event.active == true ? .riding : .lobby
+            if !resuming { prepareTrack() }
+            else if phase == .lobby { updateLocal(localStatus) }
+        case "roster":
+            setRoster(event.riders ?? [])
+        case "started":
+            phase = .riding
+        case "pose":
+            if let id = event.id, let pose = event.pose, id != localID, phase == .riding,
+               riders.contains(where: { $0.id == id }) {
+                motions[id, default: RemoteBikeMotion()].receive(pose, at: ProcessInfo.processInfo.systemUptime)
+            }
+        case "notice":
+            notice = event.notice
+        case "error", "ended":
+            finish(reason: event.notice ?? "The Free Ride ended.")
+        default:
+            break
+        }
     }
 
-    private func prepareTrack(_ config: RideManifest) {
+    private func prepareTrack() {
+        guard let info = roomTrack, let server else { return }
         transfer?.cancel()
+        pendingTrack = nil
         notice = nil
-        updateLocal(config.download != nil && !isHost ? .downloading : .loading)
-        // Capture the current terrain before the guest's shared start replaces it.
-        let current = currentTrack?() ?? Track()
         let hosted = hostedTrack
+        let current = currentTrack?() ?? Track()
+        let id = sessionID
+        let startSlot = slot
+        updateLocal(info.grant != nil && hosted == nil ? .downloading : .loading)
         transfer = Task {
             do {
                 let terrain: Track
-                if let hosted {
-                    terrain = hosted
-                } else if let download = config.download {
-                    terrain = try await TrackTransfer.load(download, name: config.name, current: current)
+                if let hosted { terrain = hosted }
+                else if let grant = info.grant, let hash = info.sha256 {
+                    let download = TrackDownload(server: server, grant: grant, sha256: hash)
+                    terrain = try await TrackTransfer.load(download, name: info.name, current: current)
                 } else {
                     terrain = Track()
                 }
                 try Task.checkCancellation()
-                let track = try config.placed(terrain, rider: localID)
+                guard sessionID == id else { return }
+                let start = RideStart(position: info.start, heading: info.heading)
+                pendingTrack = try start.placed(terrain, slot: startSlot)
                 updateLocal(.loading)
-                pendingTrack = track
                 trackRequest += 1
             } catch {
-                guard !Task.isCancelled else { return }
+                guard sessionID == id, !Task.isCancelled else { return }
                 updateLocal(.failed)
                 notice = error.localizedDescription
             }
         }
     }
 
-    private func refreshRiders() {
-        guard let match else { return }
-        for player in [GKLocalPlayer.local as GKPlayer] + match.players where !riders.contains(where: { $0.id == player.gamePlayerID }) {
-            riders.append(Rider(id: player.gamePlayerID, name: player.displayName, status: .connecting))
-        }
+    private func setRoster(_ roster: [Rider]) {
+        riders = roster
+        let present = Set(roster.map(\.id))
+        motions = motions.filter { present.contains($0.key) }
     }
 
     private func updateLocal(_ status: LoadStatus) {
-        updateStatus(status, for: localID)
-        _ = send(.status(status), reportError: false)
+        localStatus = status
+        send(RoomCommand(type: "status", status: status.rawValue))
     }
 
-    private func updateStatus(_ status: LoadStatus, for id: String) {
-        if let index = riders.firstIndex(where: { $0.id == id }), riders[index].status != status {
-            riders[index].status = status
+    private func send(_ command: RoomCommand) {
+        guard connected, let socket else { return }
+        Task {
+            do { try await Self.send(command, over: socket) }
+            catch { socket.cancel(with: .goingAway, reason: nil) }
         }
     }
 
-    @discardableResult
-    private func send(_ message: RideMessage, to player: GKPlayer? = nil,
-                      mode: GKMatch.SendDataMode = .reliable, reportError: Bool = true) -> Bool {
-        guard let match else { return false }
-        do {
-            let data = try JSONEncoder().encode(RidePacket(version: Self.protocolVersion, message: message))
-            guard data.count <= Self.maxPacketBytes else { return false }
-            if let player {
-                try match.send(data, to: [player], dataMode: mode)
-            } else {
-                try match.sendData(toAllPlayers: data, with: mode)
-            }
-            return true
-        } catch {
-            if reportError { notice = "Could not send a Free Ride update. Try again." }
-            return false
-        }
+    private static func send(_ packet: RoomCommand, over socket: URLSessionWebSocketTask) async throws {
+        let bytes = try JSONEncoder().encode(packet)
+        try await socket.send(.string(String(decoding: bytes, as: UTF8.self)))
     }
 
-    private func receive(_ message: RideMessage, from player: GKPlayer) {
-        let id = player.gamePlayerID
-        switch message {
-        case .hello:
-            if isHost, phase == .lobby, let manifest, manifest.roster.contains(id) {
-                _ = send(.setup(manifest), to: player)
-            }
-        case .setup(let config):
-            guard !isHost, phase == .lobby, id == hostID, manifest == nil else { return }
-            guard config.trackVersion == SharedTrack.version else {
-                leave(reason: "This Free Ride uses a different MotoSim track version.")
-                return
-            }
-            let connected = Set((match?.players.map(\.gamePlayerID) ?? []) + [localID])
-            guard (2...4).contains(config.roster.count), Set(config.roster) == connected,
-                  config.roster.first == id, !config.name.isEmpty, config.name.count <= 100 else { return }
-            manifest = config
-            prepareTrack(config)
-        case .status(let status):
-            guard phase == .lobby, status != .disconnected else { return }
-            updateStatus(status, for: id)
-        case .start:
-            if !isHost, id == hostID, phase == .lobby,
-               riders.first(where: { $0.id == localID })?.status == .ready {
-                phase = .riding
-            }
-        case .end:
-            if !isHost, id == hostID { leave(reason: "The host ended the Free Ride. You can keep riding locally.") }
-        case .movement(let snapshot), .reset(let snapshot):
-            guard phase == .riding, riders.contains(where: { $0.id == id && $0.status != .disconnected }) else { return }
-            motions[id, default: RemoteBikeMotion()].receive(snapshot, at: ProcessInfo.processInfo.systemUptime)
-        }
+    private func finish(reason: String? = nil) {
+        sessionID = UUID()
+        socket?.cancel(with: .normalClosure, reason: nil)
+        socket = nil
+        connectionTask?.cancel()
+        connectionTask = nil
+        transfer?.cancel()
+        transfer = nil
+        movementTask?.cancel()
+        movementTask = nil
+        motions.removeAll()
+        riders.removeAll()
+        pendingTrack = nil
+        hostedTrack = nil
+        roomTrack = nil
+        server = nil
+        localID = nil
+        resumeToken = nil
+        localStatus = .loading
+        roomCode = ""
+        connected = false
+        isHost = false
+        phase = .idle
+        sequence = 0
+        generation = 0
+        nextSendAt = 0
+        notice = reason
+        if reason != nil { showLobby = true }
     }
-}
-
-extension FreeRideSession: GKLocalPlayerListener, GKMatchmakerViewControllerDelegate, GKMatchDelegate {
-    nonisolated func player(_ player: GKPlayer, didAccept invite: GKInvite) {
-        Task { @MainActor in await acceptInvite(invite) }
-    }
-
-    private func acceptInvite(_ invite: GKInvite) async {
-        leave()
-        hostID = invite.sender.gamePlayerID
-        // An invite can launch the app before its SwiftUI window is ready.
-        for _ in 0..<20 {
-            if let presenter = presenter(), presenter.viewIfLoaded?.window != nil,
-               !presenter.isBeingDismissed, !presenter.isBeingPresented,
-               UIApplication.shared.applicationState == .active { break }
-            try? await Task.sleep(for: .milliseconds(150))
-        }
-        guard phase == .idle, hostID == invite.sender.gamePlayerID else { return }
-        guard let controller = GKMatchmakerViewController(invite: invite) else {
-            leave(reason: "Game Center could not open this Free Ride invitation.")
-            return
-        }
-        presentMatchmaker(controller)
-    }
-
-    nonisolated func matchmakerViewControllerWasCancelled(_ viewController: GKMatchmakerViewController) {
-        Task { @MainActor in
-            guard viewController === matchmaker else { return }
-            leave()
-        }
-    }
-
-    nonisolated func matchmakerViewController(_ viewController: GKMatchmakerViewController, didFailWithError error: Error) {
-        Task { @MainActor in
-            guard viewController === matchmaker else { return }
-            leave(reason: error.localizedDescription)
-        }
-    }
-
-    nonisolated func matchmakerViewController(_ viewController: GKMatchmakerViewController, didFind match: GKMatch) {
-        Task { @MainActor in
-            guard viewController === matchmaker else { match.disconnect(); return }
-            viewController.dismiss(animated: true) { [weak self] in
-                guard let self, self.matchmaker === viewController else { match.disconnect(); return }
-                self.matchmaker = nil
-                self.begin(match)
-            }
-        }
-    }
-
-    nonisolated func match(_ match: GKMatch, didReceive data: Data, fromRemotePlayer player: GKPlayer) {
-        Task { @MainActor in
-            guard match === self.match, data.count <= Self.maxPacketBytes,
-                  let packet = try? JSONDecoder().decode(RidePacket.self, from: data) else { return }
-            guard packet.version == Self.protocolVersion else {
-                if player.gamePlayerID == hostID || isHost {
-                    leave(reason: "A rider is using an incompatible MotoSim version.")
-                }
-                return
-            }
-            receive(packet.message, from: player)
-        }
-    }
-
-    nonisolated func match(_ match: GKMatch, player: GKPlayer, didChange state: GKPlayerConnectionState) {
-        Task { @MainActor in connectionChanged(match, player: player, state: state) }
-    }
-
-    private func connectionChanged(_ match: GKMatch, player: GKPlayer, state: GKPlayerConnectionState) {
-        guard match === self.match else { return }
-        let id = player.gamePlayerID
-        switch state {
-        case .connected:
-            refreshRiders()
-        case .disconnected:
-            if id == hostID || phase == .lobby {
-                let reason = id == hostID ? "The host left. You can keep riding locally."
-                    : "A rider disconnected while the lobby was loading. Start a new Free Ride to retry."
-                leave(reason: reason)
-                return
-            }
-            updateStatus(.disconnected, for: id)
-            notice = "\(player.displayName) disconnected."
-            removalTasks[id]?.cancel()
-            removalTasks[id] = Task {
-                do { try await Task.sleep(for: .seconds(2)) } catch { return }
-                motions[id] = nil
-                removalTasks[id] = nil
-            }
-        case .unknown:
-            break
-        @unknown default:
-            break
-        }
-    }
-
-    nonisolated func match(_ match: GKMatch, didFailWithError error: Error?) {
-        Task { @MainActor in
-            guard match === self.match else { return }
-            leave(reason: error?.localizedDescription ?? "The Free Ride connection ended.")
-        }
-    }
-
-    nonisolated func match(_ match: GKMatch, shouldReinviteDisconnectedPlayer player: GKPlayer) -> Bool { false }
 }

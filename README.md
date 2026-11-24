@@ -36,6 +36,6 @@ The importer supports heightfield tracks. Locked archives and mesh-only `.trp` t
 
 ## Online Free Ride
 
-Enable Game Center for the MotoSim bundle ID in your Apple developer setup and use a provisioning profile with the Game Center entitlement. On two iPhones signed in to Game Center, open **Track → Free Ride**, choose **Host Free Ride**, and send a private invitation. Guests join by opening the invitation. The host starts the ride after everyone has loaded the track.
+Start the [Go multiplayer server](backend/README.md) and install the current MotoSim build on both players’ devices. Open **Track → Free Ride** and choose **Host Free Ride**. Share the room code. Guests enter it under **Join** and connect to the same server. The host starts once all riders are ready.
 
-For a custom track, start the [Go track server](backend/README.md) and enter its HTTPS address and the upload key when hosting. The app uploads a temporary copy of the selected terrain and ground art. Guests with a verified copy reuse it, and guests who need the track download it automatically before they can ride.
+When hosting an imported track, enter the upload key from the server’s configuration. The app uploads the terrain and ground art, and guests automatically download a verified copy if needed. The built-in circuit and joining a room require only the server address and, for guests, the room code.

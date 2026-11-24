@@ -40,6 +40,7 @@ type bucket interface {
 }
 
 type server struct {
+	hub     *rideHub
 	bucket  bucket
 	secret  []byte
 	now     func() time.Time
@@ -52,6 +53,9 @@ func (s server) routes() http.Handler {
 		fmt.Fprintln(w, "ok")
 	})
 	routes.HandleFunc("POST /v1/tracks", s.upload)
+	if s.hub != nil {
+		routes.HandleFunc("GET /v1/rooms/connect", s.roomSocket)
+	}
 	routes.HandleFunc("GET /v1/tracks/{grant}", s.download)
 	return routes
 }
@@ -148,20 +152,28 @@ func (s server) signature(payload string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func (s server) download(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "private, no-store")
-	grant := strings.Split(r.PathValue("grant"), ".")
+func (s server) verifyGrant(text string) (string, int64, bool) {
+	grant := strings.Split(text, ".")
 	if len(grant) != 3 || !idPattern.MatchString(grant[0]) || len(grant[1]) > 12 ||
 		!hmac.Equal([]byte(s.signature(grant[0]+"."+grant[1])), []byte(grant[2])) {
+		return "", 0, false
+	}
+	expires, err := strconv.ParseInt(grant[1], 10, 64)
+	return grant[0], expires, err == nil
+}
+
+func (s server) download(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	id, expires, valid := s.verifyGrant(r.PathValue("grant"))
+	if !valid {
 		http.NotFound(w, r)
 		return
 	}
-	expires, err := strconv.ParseInt(grant[1], 10, 64)
-	if err != nil || s.now().Unix() >= expires {
+	if s.now().Unix() >= expires {
 		http.Error(w, "Track download expired", http.StatusGone)
 		return
 	}
-	body, size, err := s.bucket.get(r.Context(), objectPrefix+grant[0])
+	body, size, err := s.bucket.get(r.Context(), objectPrefix+id)
 	if errors.Is(err, errTrackMissing) {
 		http.NotFound(w, r)
 		return
@@ -203,7 +215,9 @@ func main() {
 		log.Fatalf("Clean temporary tracks: %v", err)
 	}
 	go store.sweep(ctx)
-	app := server{bucket: store, secret: []byte(secret), now: time.Now, uploads: make(chan struct{}, 4)}
+	hub := newRideHub()
+	go hub.sweep(ctx)
+	app := server{hub: hub, bucket: store, secret: []byte(secret), now: time.Now, uploads: make(chan struct{}, 4)}
 	httpServer := &http.Server{
 		Addr: ":8080", Handler: app.routes(), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 2 * time.Minute, WriteTimeout: 4 * time.Minute, IdleTimeout: 45 * time.Second,

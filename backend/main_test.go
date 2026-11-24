@@ -41,12 +41,7 @@ func TestTrackUploadDownloadAndExpiry(t *testing.T) {
 	bucket := localBucket{root: t.TempDir()}
 	handler := server{bucket: bucket, secret: []byte(secret), now: func() time.Time { return now },
 		uploads: make(chan struct{}, 1)}.routes()
-	contents := make([]byte, 44)
-	copy(contents, "MSTK")
-	fields := []uint32{1, math.Float32bits(20), math.Float32bits(20), math.Float32bits(5), 2, 2, 0, 0}
-	for index, value := range fields {
-		binary.LittleEndian.PutUint32(contents[4+index*4:], value)
-	}
+	contents := testTrackPackage()
 	request := func(method, path string, body io.Reader, authorized bool) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, body)
 		if authorized {
@@ -158,4 +153,14 @@ func TestLocalCleanupPreservesActiveAndUnrelatedFiles(t *testing.T) {
 			t.Fatalf("%s should be removed, got %v", name, err)
 		}
 	}
+}
+
+func testTrackPackage() []byte {
+	contents := make([]byte, 44)
+	copy(contents, "MSTK")
+	fields := []uint32{1, math.Float32bits(20), math.Float32bits(20), math.Float32bits(5), 2, 2, 0, 0}
+	for index, value := range fields {
+		binary.LittleEndian.PutUint32(contents[4+index*4:], value)
+	}
+	return contents
 }

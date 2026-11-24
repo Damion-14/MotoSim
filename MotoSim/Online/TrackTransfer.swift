@@ -1,6 +1,8 @@
 import Foundation
 
 enum TrackTransfer {
+    static let defaultServerAddress = Bundle.main.object(forInfoDictionaryKey: "MotoSimServerURL") as? String ?? ""
+
     enum Failure: LocalizedError {
         case configuration, denied, expired, transferFailed
 

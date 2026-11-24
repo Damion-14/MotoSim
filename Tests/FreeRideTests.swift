@@ -33,17 +33,15 @@ final class FreeRideTests: XCTestCase {
         let field = HeightField(columns: 2, rows: 2, width: 4, length: 4,
                                 elevationRange: 0, samples: [0, 0, 0, 0])
         let track = Track(name: "Edge", heightField: field)
-        let roster = ["host", "first", "second", "third"]
-        let manifest = RideManifest(trackVersion: SharedTrack.version, name: "Edge", download: nil,
-                                    start: [1.98, -1.99], heading: .pi / 4, roster: roster)
-        let positions = try roster.map { rider in try manifest.placed(track, rider: rider).startPosition }
+        let start = RideStart(position: [1.98, -1.99], heading: .pi / 4)
+        let positions = try (0..<4).map { try start.placed(track, slot: $0).startPosition }
         for index in positions.indices {
             XCTAssertTrue(track.contains(positions[index]))
             for other in positions.dropFirst(index + 1) {
                 XCTAssertGreaterThan(simd_distance(positions[index], other), 1)
             }
         }
-        XCTAssertThrowsError(try manifest.placed(track, rider: "unexpected"))
+        XCTAssertThrowsError(try start.placed(track, slot: 4))
     }
 
     func testRemoteInterpolationSurvivesJitterDropoutAndRespawn() throws {
