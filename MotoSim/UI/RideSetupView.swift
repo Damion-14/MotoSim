@@ -23,7 +23,9 @@ private struct TouchdownCSV: FileDocument {
 struct RideSetupView: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var tuning: RideTuning
+    @Binding var physicsMode: RidePhysicsMode
     @Binding var showTireDebug: Bool
+    @Binding var showPerformanceDebug: Bool
 
     let touchdownCSV: String
     @State private var exportingTrace = false
@@ -32,6 +34,19 @@ struct RideSetupView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Picker("Physics mode", selection: $physicsMode) {
+                        Text("Simulation").tag(RidePhysicsMode.simulation)
+                        Text("Arcade").tag(RidePhysicsMode.arcade)
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Physics")
+                } footer: {
+                    Text(physicsMode == .arcade
+                         ? "Point the bike through turns, adjust its angle in the air, and recover automatically from bad landings."
+                         : "Steer with lean and balance the bike through turns and landings.")
+                }
                 Section {
                     adjustment("Maximum lean", value: $tuning.maximumLeanDegrees,
                                range: RideTuning.leanRange, step: 1,
@@ -80,6 +95,7 @@ struct RideSetupView: View {
                     Text("Fork spring rate is the combined rate for both fork legs. Higher rebound damping slows extension and can leave the suspension compressed through repeated bumps. Shock compression settings respond to damper shaft speed.")
                 }
                 Section("Diagnostics") {
+                    Toggle("FPS & Network Latency", isOn: $showPerformanceDebug)
                     Toggle("Tire & Suspension Telemetry", isOn: $showTireDebug)
                     Button("Export Last Touchdown CSV") { exportingTrace = true }
                         .disabled(touchdownCSV.isEmpty)

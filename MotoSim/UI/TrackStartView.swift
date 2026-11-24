@@ -78,6 +78,17 @@ struct TrackStartView: View {
                 }
             }
             .overlay {
+                if !track.courseLine.isEmpty {
+                    Path { path in
+                        path.addLines(track.courseLine.map {
+                            CGPoint(x: CGFloat($0.x) * size.width, y: CGFloat($0.y) * size.height)
+                        })
+                    }
+                    .stroke(.orange.opacity(0.9), lineWidth: 1.5)
+                    .allowsHitTesting(false)
+                }
+            }
+            .overlay {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 22, weight: .bold))
                     .foregroundStyle(.white, .orange)

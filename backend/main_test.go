@@ -164,3 +164,47 @@ func testTrackPackage() []byte {
 	}
 	return contents
 }
+
+func TestPackageAcceptsTheMaximumNativeHeightfield(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "track")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	const samples = 4097
+	const art = 2048
+	header := testTrackPackage()[:36]
+	binary.LittleEndian.PutUint32(header[20:], samples)
+	binary.LittleEndian.PutUint32(header[24:], samples)
+	binary.LittleEndian.PutUint32(header[28:], art)
+	binary.LittleEndian.PutUint32(header[32:], art)
+	if _, err := file.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	const size = 36 + samples*samples*2 + art*art*4
+	if err := file.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if size > maxTrackBytes || !validPackage(file, size) {
+		t.Fatal("full resolution package should fit the existing upload limit")
+	}
+	binary.LittleEndian.PutUint32(header[4:], trackVersion)
+	if _, err := file.WriteAt(header, 0); err != nil {
+		t.Fatal(err)
+	}
+	var grass [36]byte
+	for i, value := range []uint32{1024, 1024, 2048, 2048, math.Float32bits(7), math.Float32bits(1), 0, math.Float32bits(0.5), 0} {
+		binary.LittleEndian.PutUint32(grass[4*i:], value)
+	}
+	if _, err := file.WriteAt(grass[:], size); err != nil {
+		t.Fatal(err)
+	}
+	const planted = size + 36 + 1024*1024*4 + 2048*2048
+	if err := file.Truncate(planted); err != nil {
+		t.Fatal(err)
+	}
+	if planted > maxTrackBytes || !validPackage(file, planted) || validPackage(file, planted-1) {
+		t.Fatal("full-resolution package should preserve authored grass within the upload limit")
+	}
+
+}

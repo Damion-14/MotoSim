@@ -13,6 +13,12 @@ final class GameScene: ObservableObject {
         case failed
     }
 
+    struct PerformanceReadout: Equatable {
+        let fps: Int
+        let online: Bool
+        let latencyMS: Int?
+    }
+
     @Published private(set) var startup = Startup.terrain(0)
     @Published private(set) var speed = 0
     @Published private(set) var rpm = 2200
@@ -21,8 +27,13 @@ final class GameScene: ObservableObject {
     @Published private(set) var error: String?
     @Published private(set) var soundEnabled = false
     @Published private(set) var tireDebug: TireDebugReadout?
-    var active = true
-    var showingMenu = false
+    @Published private(set) var performanceDebug: PerformanceReadout?
+    var active = true {
+        didSet { if oldValue != active { resetPerformanceWindow() } }
+    }
+    var showingMenu = false {
+        didSet { if oldValue != showingMenu { resetPerformanceWindow() } }
+    }
     weak var freeRide: FreeRideSession?
     private(set) var track = Track()
 
@@ -33,17 +44,26 @@ final class GameScene: ObservableObject {
     private let sceneRoot = Entity()
     private let camera = PerspectiveCamera()
     private var currentWorld: Entity?
+    private var terrainDetail: TerrainRenderer.TileDetail?
+    private var grassRenderer: GrassRenderer?
     private var subscription: EventSubscription?
     private var bike: BikeRenderer?
     private var remoteBikes: [String: BikeRenderer] = [:]
     private var cameraPosition: SIMD3<Float>?
     private var tireVectors: TireVectorRenderer?
     private var tireReadoutElapsed: Float = 0
+    private var measuresPerformance = false
+    private var performanceWindowStart: TimeInterval?
+    private var performanceFrames = 0
 
     var touchdownCSV: String { simulation.suspensionTrace.csv }
 
     func applyTuning(_ tuning: RideTuning) {
         simulation.tuning = tuning
+    }
+
+    func applyPhysicsMode(_ mode: RidePhysicsMode) {
+        simulation.setPhysicsMode(mode)
     }
 
     func setTireDebug(_ enabled: Bool) {
@@ -57,14 +77,27 @@ final class GameScene: ObservableObject {
         if !enabled { tireDebug = nil }
     }
 
+    func setPerformanceDebug(_ enabled: Bool) {
+        measuresPerformance = enabled
+        resetPerformanceWindow()
+        performanceDebug = nil
+    }
+
     func selectTrack(_ track: Track) {
         controls.releaseTouch()
         clearRemoteBikes()
+        terrainDetail?.cancel()
+        terrainDetail = nil
+        grassRenderer?.cancel()
+        grassRenderer = nil
         self.track = track
         let debugEnabled = simulation.collectsTireTrace
-        simulation = Motorcycle(configuration: simulation.configuration, track: track, tuning: simulation.tuning)
+        simulation = Motorcycle(configuration: simulation.configuration, track: track, tuning: simulation.tuning,
+                                physicsMode: simulation.physicsMode)
         simulation.collectsTireTrace = debugEnabled
         tireDebug = nil
+        resetPerformanceWindow()
+        performanceDebug = nil
         tireVectors?.update(front: simulation.frontTrace, rear: simulation.rearTrace)
         bike = nil
         cameraPosition = nil
@@ -97,11 +130,12 @@ final class GameScene: ObservableObject {
         let skyDome = ModelEntity(mesh: .generateSphere(radius: max(160, dimensions * 1.2)), materials: [sky])
         skyDome.components.set(DynamicLightShadowComponent(castsShadow: false))
         world.addChild(skyDome)
+        let terrain: TerrainRenderer.Surface
         do {
-            let terrain = try await TerrainRenderer.make(loadingTrack) { [weak self] fraction in
+            terrain = try await TerrainRenderer.make(loadingTrack) { [weak self] fraction in
                 if !Task.isCancelled { self?.startup = .terrain(fraction) }
             }
-            world.addChild(terrain)
+            world.addChild(terrain.entity)
         } catch is CancellationError {
             return
         } catch {
@@ -109,6 +143,12 @@ final class GameScene: ObservableObject {
             freeRide?.terrainFailed()
             return
         }
+        var grassRenderer: GrassRenderer?
+        if let field = loadingTrack.heightField, let grass = loadingTrack.grass {
+            grassRenderer = try? await GrassRenderer.make(field: field, grass: grass)
+            if let grassRenderer { world.addChild(grassRenderer.root) }
+        }
+        guard !Task.isCancelled else { return }
         startup = .bike
         if loadingTrack.heightField == nil {
             TerrainRenderer.addMarkers(to: world, track: loadingTrack)
@@ -131,6 +171,8 @@ final class GameScene: ObservableObject {
         }
         guard !Task.isCancelled else { return }
         self.bike = bike
+        terrainDetail = terrain.detail
+        self.grassRenderer = grassRenderer
         world.addChild(bike.root)
         // Keep the virtual camera attached to the same RealityKit scene across imports.
         currentWorld?.removeFromParent()
@@ -177,6 +219,9 @@ final class GameScene: ObservableObject {
         let time = ProcessInfo.processInfo.systemUptime
         if elapsed > 0 { updateRemoteBikes(at: time) }
         let canRide = active && !showingMenu && freeRide?.blocksRiding != true
+        if measuresPerformance, elapsed > 0, canRide {
+            updatePerformanceDebug(at: time)
+        }
         if elapsed > 0 && !canRide {
             freeRide?.sendPose(simulation.pose, at: time)
             return
@@ -187,6 +232,8 @@ final class GameScene: ObservableObject {
             freeRide?.respawned()
         }
         let pose = simulation.pose
+        terrainDetail?.update(near: pose.position)
+        grassRenderer?.update(near: pose.position)
         freeRide?.sendPose(pose, at: time)
         bike.update(pose)
         if simulation.collectsTireTrace {
@@ -214,6 +261,27 @@ final class GameScene: ObservableObject {
     func clearRemoteBikes() {
         for bike in remoteBikes.values { bike.root.removeFromParent() }
         remoteBikes.removeAll()
+    }
+
+    private func updatePerformanceDebug(at time: TimeInterval) {
+        guard let start = performanceWindowStart else {
+            performanceWindowStart = time
+            return
+        }
+        performanceFrames += 1
+        let duration = time - start
+        guard duration >= 0.5 else { return }
+        let readout = PerformanceReadout(fps: Int((Double(performanceFrames) / duration).rounded()),
+                                         online: freeRide?.connected == true,
+                                         latencyMS: freeRide?.sampleLatency(at: time))
+        if performanceDebug != readout { performanceDebug = readout }
+        performanceWindowStart = time
+        performanceFrames = 0
+    }
+
+    private func resetPerformanceWindow() {
+        performanceWindowStart = nil
+        performanceFrames = 0
     }
 
     private func updateRemoteBikes(at time: TimeInterval) {

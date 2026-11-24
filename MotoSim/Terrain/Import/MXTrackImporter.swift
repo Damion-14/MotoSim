@@ -1,6 +1,20 @@
 import Foundation
 
 enum MXTrackImporter {
+    enum Progress: Sendable, Equatable {
+        case opening, terrain, extracting(Double), textures, complete
+
+        var fraction: Double {
+            switch self {
+            case .opening: 0
+            case .terrain: 0.12
+            case .extracting(let fraction): 0.22 + fraction * 0.56
+            case .textures: 0.82
+            case .complete: 1
+            }
+        }
+    }
+
     enum ImportError: LocalizedError {
         case descriptorMissing
         case multipleDescriptors
@@ -33,15 +47,31 @@ enum MXTrackImporter {
         }
     }
 
-    static func load(file: URL) throws -> Track {
+    static func load(file: URL, progress: (Progress) -> Void = { _ in }) throws -> Track {
         if try file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
-            return try load(folder: file)
+            return try load(folder: file, progress: progress)
         }
+        progress(.opening)
         let name = file.deletingPathExtension().lastPathComponent
         guard ["pkz", "zip"].contains(file.pathExtension.lowercased()) else { throw ImportError.unsupportedFile }
         let data = try Data(contentsOf: file, options: .mappedIfSafe)
+        progress(.terrain)
         let files = try PKZArchive.trackFiles(in: data, named: name)
-        return try loadCompiled(files.terrain, name: name, artwork: files.artwork)
+        var track = try loadCompiled(files.terrain, name: name, artwork: files.artwork)
+        if let compiled = files.map {
+            progress(.extracting(0))
+            if let material = try? compiled.materials(extractionProgress: {
+                progress(.extracting($0))
+            }, beforeDecoding: {
+                progress(.textures)
+            }) {
+                track.groundArt = material.ground
+                track.grass = material.grass
+            }
+        }
+        try Task.checkCancellation()
+        progress(.complete)
+        return track
     }
 
     private static func loadCompiled(_ data: Data, name: String, artwork: Data?) throws -> Track {
@@ -49,7 +79,7 @@ enum MXTrackImporter {
         guard data.count >= 24, data.le32(0) == 0x00485254 else { throw ImportError.invalidCompiledHeightfield }
         let columns = Int(data.le32(4))
         let rows = Int(data.le32(8))
-        guard (2...4097).contains(columns), (2...4097).contains(rows) else {
+        guard (2...HeightField.maxImportedSamplesPerAxis).contains(columns), (2...HeightField.maxImportedSamplesPerAxis).contains(rows) else {
             throw ImportError.invalidCompiledHeightfield
         }
         let dimensions = 12 + columns * rows * 2
@@ -63,13 +93,20 @@ enum MXTrackImporter {
 
         var track = try makeTrack(name: name, data: data, offset: 12, signed: true, columns: columns, rows: rows,
                                   width: width, length: length, scale: scale)
-        if let field = track.heightField {
-            track.groundArt = TrackGroundArt.make(terrain: data, artwork: artwork, field: field)
+        if let field = track.heightField,
+           let layout = TrackGroundArt.layout(terrain: data, artwork: artwork, field: field) {
+            track.groundArt = layout.art
+            track.courseLine = layout.route
+            if track.contains([layout.start.x, 0, layout.start.y]) {
+                track.startPosition = [layout.start.x, 0, layout.start.y]
+                track.startHeading = layout.heading
+            }
         }
         return track
     }
 
-    static func load(folder: URL) throws -> Track {
+    static func load(folder: URL, progress: (Progress) -> Void = { _ in }) throws -> Track {
+        progress(.opening)
         let root = folder.resolvingSymlinksInPath().standardizedFileURL
         let items = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey])
         let collision = items.filter { $0.pathExtension.lowercased() == "tht" }
@@ -91,8 +128,19 @@ enum MXTrackImporter {
                           size < 17_000_000 else { return nil }
                     return try? Data(contentsOf: resolved, options: .mappedIfSafe)
                 }
-                return try loadCompiled(Data(contentsOf: url, options: .mappedIfSafe),
-                                        name: folder.lastPathComponent, artwork: artwork)
+                progress(.terrain)
+                var track = try loadCompiled(Data(contentsOf: url, options: .mappedIfSafe),
+                                             name: folder.lastPathComponent, artwork: artwork)
+                progress(.textures)
+                let mapURL = url.deletingPathExtension().appendingPathExtension("map")
+                if let data = artworkFile(mapURL, root: root, limit: 1_500_000_000),
+                   let material = try? CompiledTerrainMaterials.load(in: data) {
+                    track.groundArt = material.ground
+                    track.grass = material.grass
+                }
+                try Task.checkCancellation()
+                progress(.complete)
+                return track
             }
             if binary.count > 1 { throw ImportError.multipleDescriptors }
             let compiledExtensions = Set(["pkz", "trh", "map", "trp"])
@@ -117,45 +165,61 @@ enum MXTrackImporter {
         let expectedBytes = config.columns * config.rows * 2
         guard raw.fileSize == expectedBytes else { throw ImportError.invalidHeightmapSize(expectedBytes) }
 
+        progress(.terrain)
         let bytesData = try Data(contentsOf: rawURL, options: .mappedIfSafe)
         guard bytesData.count == expectedBytes else { throw ImportError.invalidHeightmapSize(expectedBytes) }
-        return try makeTrack(name: folder.lastPathComponent, data: bytesData, offset: 0, signed: false,
-                             columns: config.columns, rows: config.rows, width: config.width,
-                             length: config.length, scale: config.scale)
+        var track = try makeTrack(name: folder.lastPathComponent, data: bytesData, offset: 0, signed: false,
+                                  columns: config.columns, rows: config.rows, width: config.width,
+                                  length: config.length, scale: config.scale)
+        let matchingVisual = visual.first {
+            $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(
+                descriptor.deletingPathExtension().lastPathComponent
+            ) == .orderedSame
+        }
+        if let hmf = matchingVisual ?? (visual.count == 1 ? visual.first : nil),
+           let field = track.heightField,
+           let data = artworkFile(hmf, root: root, limit: 1_048_576),
+           let text = String(data: data, encoding: .utf8) {
+            progress(.textures)
+            track.groundArt = try TerrainTexture.bake(text, field: field) { path in
+                let relative = path.replacingOccurrences(of: "\\", with: "/")
+                guard !relative.hasPrefix("/"), !relative.contains(":"),
+                      !relative.split(separator: "/").contains(".."),
+                      (relative as NSString).pathExtension.lowercased() == "tga" else { return nil }
+                return artworkFile(root.appending(path: relative), root: root, limit: 20_000_000)
+            }
+        }
+        try Task.checkCancellation()
+        progress(.complete)
+        return track
+    }
+
+    private static func artworkFile(_ url: URL, root: URL, limit: Int) -> Data? {
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+        guard isInside(resolved, root: root),
+              let info = try? resolved.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              info.isRegularFile == true, let bytes = info.fileSize, (1...limit).contains(bytes) else { return nil }
+        return try? Data(contentsOf: resolved, options: .mappedIfSafe)
     }
 
     private static func makeTrack(name: String, data: Data, offset: Int, signed: Bool,
                                   columns sourceColumns: Int, rows sourceRows: Int,
                                   width: Float, length: Float, scale: Float) throws -> Track {
-        let columns = min(1025, sourceColumns)
-        let rows = min(1025, sourceRows)
         let samples: [UInt16] = try data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
-            func value(_ x: Int, _ y: Int) -> Float {
-                let index = offset + (y * sourceColumns + x) * 2
-                let raw = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
-                return Float(signed ? raw ^ 0x8000 : raw)
-            }
+            let source = bytes.bindMemory(to: UInt8.self)
             var heights: [UInt16] = []
-            heights.reserveCapacity(columns * rows)
-            for row in 0..<rows {
+            heights.reserveCapacity(sourceColumns * sourceRows)
+            for row in 0..<sourceRows {
                 try Task.checkCancellation()
-                let z = Float(row) * Float(sourceRows - 1) / Float(rows - 1)
-                let j = Int(z)
-                let nextRow = min(j + 1, sourceRows - 1)
-                for column in 0..<columns {
-                    let x = Float(column) * Float(sourceColumns - 1) / Float(columns - 1)
-                    let i = Int(x)
-                    let nextColumn = min(i + 1, sourceColumns - 1)
-                    let u = x - Float(i)
-                    let v = z - Float(j)
-                    let top = value(i, j) * (1 - u) + value(nextColumn, j) * u
-                    let bottom = value(i, nextRow) * (1 - u) + value(nextColumn, nextRow) * u
-                    heights.append(UInt16((top * (1 - v) + bottom * v).rounded()))
+                for column in 0..<sourceColumns {
+                    let index = offset + (row * sourceColumns + column) * 2
+                    let raw = UInt16(source[index]) | (UInt16(source[index + 1]) << 8)
+                    heights.append(signed ? raw ^ 0x8000 : raw)
                 }
             }
             return heights
         }
-        let field = HeightField(columns: columns, rows: rows, width: width, length: length,
+        let field = HeightField(columns: sourceColumns, rows: sourceRows, width: width, length: length,
                                 elevationRange: scale, samples: samples)
         return Track(name: name, heightField: field)
     }
@@ -175,8 +239,8 @@ enum MXTrackImporter {
             let value = parts[1].components(separatedBy: "//")[0].trimmingCharacters(in: .whitespacesAndNewlines)
             fields[key] = value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
         }
-        guard let columns = fields["samples_x"].flatMap(Int.init), (2...4097).contains(columns),
-              let rows = fields["samples_z"].flatMap(Int.init), (2...4097).contains(rows),
+        guard let columns = fields["samples_x"].flatMap(Int.init), (2...HeightField.maxImportedSamplesPerAxis).contains(columns),
+              let rows = fields["samples_z"].flatMap(Int.init), (2...HeightField.maxImportedSamplesPerAxis).contains(rows),
               let width = fields["size_x"].flatMap(Float.init), (4...10_000).contains(width),
               let length = fields["size_z"].flatMap(Float.init), (4...10_000).contains(length),
               let scale = fields["scale"].flatMap(Float.init), (0...5_000).contains(scale),

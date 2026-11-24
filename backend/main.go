@@ -24,9 +24,10 @@ import (
 )
 
 const (
-	maxTrackBytes = 32 << 20
-	trackTTL      = 6 * time.Hour
-	objectPrefix  = "temporary-tracks/"
+	maxTrackBytes    = 64 << 20
+	maxHeightSamples = 4097
+	trackTTL         = 6 * time.Hour
+	objectPrefix     = "temporary-tracks/"
 )
 
 var (
@@ -89,7 +90,7 @@ func (s server) upload(w http.ResponseWriter, r *http.Request) {
 	var tooBig *http.MaxBytesError
 	switch {
 	case errors.As(err, &tooBig):
-		http.Error(w, "Track exceeds 32 MiB", http.StatusRequestEntityTooLarge)
+		http.Error(w, "Track exceeds 64 MiB", http.StatusRequestEntityTooLarge)
 		return
 	case err != nil || size == 0:
 		http.Error(w, "Incomplete or empty track", http.StatusBadRequest)
@@ -135,15 +136,36 @@ func validPackage(file *os.File, size int64) bool {
 		value := math.Float32frombits(field(offset))
 		return value >= low && value <= high
 	}
-	if field(4) != 1 || !inRange(8, 4, 10_000) || !inRange(12, 4, 10_000) || !inRange(16, 0, 5_000) {
+	if (field(4) < 1 || field(4) > trackVersion) || !inRange(8, 4, 10_000) || !inRange(12, 4, 10_000) || !inRange(16, 0, 5_000) {
 		return false
 	}
 	columns, rows, artWidth, artHeight := field(20), field(24), field(28), field(32)
-	if columns < 2 || columns > 1025 || rows < 2 || rows > 1025 ||
+	if columns < 2 || columns > maxHeightSamples || rows < 2 || rows > maxHeightSamples ||
 		artWidth > 2048 || artHeight > 2048 || (artWidth == 0) != (artHeight == 0) {
 		return false
 	}
-	return size == int64(len(header))+int64(columns*rows*2)+int64(artWidth*artHeight*4)
+	baseSize := int64(len(header)) + int64(columns*rows*2) + int64(artWidth*artHeight*4)
+	if size == baseSize {
+		return true
+	}
+	if field(4) == 1 || size < baseSize+36 {
+		return false
+	}
+	var grass [36]byte
+	if _, err := file.ReadAt(grass[:], baseSize); err != nil {
+		return false
+	}
+	value := func(offset int) uint32 { return binary.LittleEndian.Uint32(grass[offset:]) }
+	grassRange := func(offset int, lower, upper float32) bool {
+		f := math.Float32frombits(value(offset))
+		return f >= lower && f <= upper
+	}
+	width, height, maskWidth, maskHeight := value(0), value(4), value(8), value(12)
+	return width >= 1 && width <= 1024 && height >= 1 && height <= 1024 &&
+		maskWidth >= 1 && maskWidth <= 2048 && maskHeight >= 1 && maskHeight <= 2048 &&
+		grassRange(16, 0.01, 200) && grassRange(20, 0.01, 10) && grassRange(24, 0, 10) &&
+		grassRange(28, 0.01, 10) && grassRange(32, 0, 10) &&
+		size == baseSize+36+int64(width*height*4)+int64(maskWidth*maskHeight)
 }
 
 func (s server) signature(payload string) string {

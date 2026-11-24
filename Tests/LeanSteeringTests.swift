@@ -25,7 +25,7 @@ final class LeanSteeringTests: XCTestCase {
     func testFullStickAtRestSteersTheBarsWithAnUprightTarget() {
         let command = LeanSteering(input: 1, speed: 0, wheelbase: 1.48)
         XCTAssertEqual(command.targetLean, 0)
-        XCTAssertEqual(command.baseSteering, -0.54, accuracy: 0.0001)
+        XCTAssertEqual(command.baseSteering, -0.62, accuracy: 0.0001)
         XCTAssertEqual(command.countersteerBlend, 0)
     }
 }

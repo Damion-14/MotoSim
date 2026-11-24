@@ -27,6 +27,26 @@ final class MXTrackImporterTests: XCTestCase {
         }
     }
 
+    func testPreservesNative4097SamplesAndSharesTheNarrowFeature() throws {
+        try withFolder { folder in
+            let columns = 4097
+            let text = descriptor().replacingOccurrences(of: "samples_x = 3", with: "samples_x = 4097")
+            try text.write(to: folder.appending(path: "test.hmf"), atomically: true, encoding: .utf8)
+            var samples = Array(repeating: UInt16(0), count: columns * 2)
+            samples[2049] = .max
+            try writeRAW(samples, to: folder.appending(path: "height field.raw"))
+            let track = try MXTrackImporter.load(folder: folder)
+            let field = try XCTUnwrap(track.heightField)
+            XCTAssertEqual(field.columns, columns)
+            XCTAssertEqual(field.samples, samples)
+            let feature = field.position(u: Float(2049) / Float(columns - 1), v: 0)
+            XCTAssertEqual(track.height(feature.x, feature.y), 12, accuracy: 0.001)
+
+            let guest = try SharedTrack.decode(SharedTrack.encode(track), name: "Guest")
+            XCTAssertEqual(guest.heightField?.samples, samples)
+        }
+    }
+
     func testUsesTHTWhenBothSourceDescriptorsExist() throws {
         try withFolder { folder in
             try descriptor(raw: "missing.raw").write(to: folder.appending(path: "test.hmf"), atomically: true, encoding: .utf8)
@@ -59,7 +79,9 @@ final class MXTrackImporterTests: XCTestCase {
         try withFolder { folder in
             let url = folder.appending(path: "track.pkz")
             try archiveFixture().write(to: url)
-            let track = try MXTrackImporter.load(file: url)
+            var progress: [MXTrackImporter.Progress] = []
+            let track = try MXTrackImporter.load(file: url) { progress.append($0) }
+            XCTAssertEqual(progress, [.opening, .terrain, .complete])
             XCTAssertEqual(track.heightField?.width, 32)
             XCTAssertEqual(track.heightField?.length, 20)
             XCTAssertEqual(track.height(-16, -10), 0, accuracy: 0.001)

@@ -1,0 +1,3 @@
+// Custom-track hosting credentials for local Debug builds.
+MOTOSIM_HOST_UPLOAD_KEY =37f6d7239fd1a53b52d2806ba59e5be0a21d966e50bd69a5caa25bd407128e5f
+#include? "Debug.local.xcconfig"

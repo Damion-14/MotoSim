@@ -4,11 +4,11 @@ enum TrackTransfer {
     static let defaultServerAddress = Bundle.main.object(forInfoDictionaryKey: "MotoSimServerURL") as? String ?? ""
 
     enum Failure: LocalizedError {
-        case configuration, denied, expired, transferFailed
+        case missingHostCredential, denied, expired, transferFailed
 
         var errorDescription: String? {
             switch self {
-            case .configuration: "Enter your track server’s HTTPS address and upload key."
+            case .missingHostCredential: "Custom-track hosting requires a configured test build and its default server."
             case .denied: "The track server rejected the upload key."
             case .expired: "The shared track expired. Ask the host to create a new Free Ride."
             case .transferFailed: "The track server could not transfer this track. Try again."
@@ -44,7 +44,21 @@ enum TrackTransfer {
         return components.url
     }
 
-    static func upload(_ track: Track, server: URL, key: String) async throws -> TrackDownload {
+    static func canUpload(to server: URL) -> Bool {
+        hostCredential(for: server) != nil
+    }
+
+    private static func hostCredential(for server: URL) -> String? {
+        guard let configured = serverURL(defaultServerAddress),
+              server.host?.lowercased() == configured.host?.lowercased(),
+              (server.port ?? 443) == (configured.port ?? 443),
+              let key = Bundle.main.object(forInfoDictionaryKey: "MotoSimHostUploadKey") as? String,
+              key.utf8.count >= 32 else { return nil }
+        return key
+    }
+
+    static func upload(_ track: Track, server: URL) async throws -> TrackDownload {
+        guard let key = hostCredential(for: server) else { throw Failure.missingHostCredential }
         let data = try SharedTrack.encode(track)
         var request = URLRequest(url: server.appending(path: "v1/tracks"), timeoutInterval: 120)
         request.httpMethod = "POST"

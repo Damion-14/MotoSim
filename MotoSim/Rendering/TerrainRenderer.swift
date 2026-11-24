@@ -3,7 +3,12 @@ import UIKit
 
 @MainActor
 enum TerrainRenderer {
-    static func make(_ track: Track, progress: @escaping @MainActor @Sendable (Double) -> Void) async throws -> Entity {
+    struct Surface {
+        let entity: Entity
+        var detail: TileDetail? = nil
+    }
+
+    static func make(_ track: Track, progress: @escaping @MainActor @Sendable (Double) -> Void) async throws -> Surface {
         if let field = track.heightField { return try await makeImported(field, groundArt: track.groundArt, progress: progress) }
         let worker = Task.detached(priority: .userInitiated) {
             try await buildMesh(track, progress: progress)
@@ -21,9 +26,9 @@ enum TerrainRenderer {
             .init(red: 0.36, green: 0.38, blue: 0.22, alpha: 1),
             .init(red: 0.34, green: 0.36, blue: 0.20, alpha: 1)
         ]
-        return ModelEntity(mesh: try .generate(from: [mesh]), materials: palette.map {
+        return Surface(entity: ModelEntity(mesh: try .generate(from: [mesh]), materials: palette.map {
             SimpleMaterial(color: $0, roughness: 1, isMetallic: false)
-        })
+        }))
     }
 
     private nonisolated static func buildMesh(
@@ -79,38 +84,120 @@ enum TerrainRenderer {
 
     private static func makeImported(
         _ field: HeightField, groundArt: TrackGroundArt?, progress: @escaping @MainActor @Sendable (Double) -> Void
-    ) async throws -> Entity {
+    ) async throws -> Surface {
         let terrain = Entity()
-        var dirt = SimpleMaterial(color: .init(red: 0.56, green: 0.34, blue: 0.22, alpha: 1),
-                                  roughness: 1, isMetallic: false)
+        var dirt = SimpleMaterial(color: .init(white: 0.52, alpha: 1), roughness: 1, isMetallic: false)
         if let image = groundArt?.makeImage(),
-           let texture = try? TextureResource.generate(from: image, options: .init(semantic: .color)) {
+           let texture = try? await TextureResource(image: image, options: .init(semantic: .color)) {
             dirt.color = .init(tint: .white, texture: .init(texture))
         }
-        let tileCells = 128
+        let tiledDetail = max(field.columns, field.rows) > 2049
+        let tileCells = tiledDetail ? 256 : 128
         let tilesX = (field.columns - 2) / tileCells + 1
         let tilesZ = (field.rows - 2) / tileCells + 1
+        var base: [SIMD2<Int>: ModelEntity] = [:]
         for z in 0..<tilesZ {
             for x in 0..<tilesX {
-                let worker = Task.detached(priority: .userInitiated) {
-                    try importedTile(field, x: x * tileCells, z: z * tileCells, cells: tileCells)
-                }
-                let descriptor = try await withTaskCancellationHandler {
-                    try await worker.value
-                } onCancel: {
-                    worker.cancel()
-                }
+                let tile = SIMD2(x, z)
+                let descriptor = try await buildTile(field, tile: tile, cells: tileCells,
+                                                     step: tiledDetail ? 2 : 1, skirts: tiledDetail)
                 try Task.checkCancellation()
-                terrain.addChild(ModelEntity(mesh: try .generate(from: [descriptor]), materials: [dirt]))
+                let model = ModelEntity(mesh: try .generate(from: [descriptor]), materials: [dirt])
+                terrain.addChild(model)
+                if tiledDetail { base[tile] = model }
                 progress(Double(z * tilesX + x + 1) / Double(tilesX * tilesZ))
             }
         }
-        return terrain
+        let detail = tiledDetail ? TileDetail(field: field, base: base, material: dirt, cells: tileCells) : nil
+        return Surface(entity: terrain, detail: detail)
     }
 
-    private nonisolated static func importedTile(_ field: HeightField, x: Int, z: Int, cells: Int) throws -> MeshDescriptor {
-        let columns = min(cells + 1, field.columns - x)
-        let rows = min(cells + 1, field.rows - z)
+    // Keep full-resolution tiles around the rider on large grids. The view
+    // toggles each tile to its finer mesh only once that mesh is available.
+    @MainActor
+    final class TileDetail {
+        private let field: HeightField
+        private let base: [SIMD2<Int>: ModelEntity]
+        private let material: SimpleMaterial
+        private let cells: Int
+        private var fine: [SIMD2<Int>: ModelEntity] = [:]
+        private var center: SIMD2<Int>?
+        private var desired: [SIMD2<Int>] = []
+        private var worker: Task<Void, Never>?
+
+        init(field: HeightField, base: [SIMD2<Int>: ModelEntity], material: SimpleMaterial, cells: Int) {
+            self.field = field
+            self.base = base
+            self.material = material
+            self.cells = cells
+        }
+
+        func update(near position: SIMD3<Float>) {
+            let column = max(0, min(field.columns - 2,
+                                    Int((position.x / field.width + 0.5) * Float(field.columns - 1))))
+            let row = max(0, min(field.rows - 2,
+                                 Int((position.z / field.length + 0.5) * Float(field.rows - 1))))
+            let tile = SIMD2(column / cells, row / cells)
+            guard tile != center else { return }
+            center = tile
+            let neighbors: [SIMD2<Int>] = [.zero, [-1, 0], [0, -1], [1, 0], [0, 1],
+                                            [-1, -1], [1, -1], [-1, 1], [1, 1]]
+            desired = neighbors.map { tile &+ $0 }.filter { base[$0] != nil }
+            for key in fine.keys.filter({ !desired.contains($0) }) {
+                fine.removeValue(forKey: key)?.removeFromParent()
+                base[key]?.isEnabled = true
+            }
+            if worker == nil {
+                worker = Task { [weak self] in
+                    await self?.loadDesired()
+                }
+            }
+        }
+
+        private func loadDesired() async {
+            defer { worker = nil }
+            var failed: Set<SIMD2<Int>> = []
+            while !Task.isCancelled, let tile = desired.first(where: { fine[$0] == nil && !failed.contains($0) }),
+                  let coarse = base[tile] {
+                do {
+                    let descriptor = try await TerrainRenderer.buildTile(field, tile: tile, cells: cells, step: 1, skirts: true)
+                    try Task.checkCancellation()
+                    guard desired.contains(tile), let parent = coarse.parent else { continue }
+                    let model = ModelEntity(mesh: try .generate(from: [descriptor]), materials: [material])
+                    parent.addChild(model)
+                    fine[tile] = model
+                    coarse.isEnabled = false
+                } catch is CancellationError {
+                    return
+                } catch {
+                    failed.insert(tile)
+                }
+            }
+        }
+
+        func cancel() { worker?.cancel() }
+    }
+
+    private static func buildTile(_ field: HeightField, tile: SIMD2<Int>, cells: Int,
+                                  step: Int, skirts: Bool) async throws -> MeshDescriptor {
+        let worker = Task.detached(priority: .userInitiated) {
+            try importedTile(field, x: tile.x * cells, z: tile.y * cells, cells: cells, step: step, skirts: skirts)
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private nonisolated static func importedTile(_ field: HeightField, x: Int, z: Int, cells: Int,
+                                                 step: Int, skirts: Bool) throws -> MeshDescriptor {
+        let endX = min(x + cells, field.columns - 1)
+        let endZ = min(z + cells, field.rows - 1)
+        let columnSamples = Array(stride(from: x, to: endX, by: step)) + [endX]
+        let rowSamples = Array(stride(from: z, to: endZ, by: step)) + [endZ]
+        let columns = columnSamples.count
+        let rows = rowSamples.count
         let dx = field.width / Float(field.columns - 1)
         let dz = field.length / Float(field.rows - 1)
         let heightScale = field.elevationRange / 65_535
@@ -122,11 +209,9 @@ enum TerrainRenderer {
         normals.reserveCapacity(columns * rows)
         uv.reserveCapacity(columns * rows)
         indices.reserveCapacity((columns - 1) * (rows - 1) * 6)
-        for row in 0..<rows {
+        for (row, j) in rowSamples.enumerated() {
             try Task.checkCancellation()
-            let j = z + row
-            for column in 0..<columns {
-                let i = x + column
+            for (column, i) in columnSamples.enumerated() {
                 let u = Float(i) / Float(field.columns - 1)
                 let v = Float(j) / Float(field.rows - 1)
                 let point = field.position(u: u, v: v)
@@ -148,6 +233,43 @@ enum TerrainRenderer {
                 let c = a + UInt32(columns)
                 indices.append(contentsOf: [a, c, b, b, c, c + 1])
             }
+        }
+        if skirts {
+            // Cover the height difference where a fine edge meets a coarser
+            // one. Size each skirt to the maximum skipped-sample error.
+            func height(_ column: Int, _ row: Int) -> Float {
+                Float(field.samples[row * field.columns + column]) * heightScale
+            }
+            func error(from: Int, to: Int, sample: (Int) -> Float) -> Float {
+                stride(from: from + 1, to: to, by: 2).reduce(0) { largest, i in
+                    max(largest, abs(sample(i) - (sample(i - 1) + sample(i + 1)) / 2))
+                }
+            }
+            func skirt(_ edge: [Int], depth: Float, outward: SIMD3<Float>) {
+                guard depth > 0.001 else { return }
+                let start = UInt32(positions.count)
+                for index in edge {
+                    positions.append(positions[index])
+                    positions.append(positions[index] - [0, depth + 0.015, 0])
+                    normals.append(contentsOf: [outward, outward])
+                    let coordinate = uv[index]
+                    uv.append(contentsOf: [coordinate, coordinate])
+                }
+                for segment in 0..<(edge.count - 1) {
+                    let a = start + UInt32(segment * 2)
+                    let b = a + 1
+                    let c = a + 2
+                    let d = a + 3
+                    indices.append(contentsOf: [a, c, b, b, c, d, b, c, a, d, c, b])
+                }
+            }
+            skirt(Array(0..<columns), depth: error(from: x, to: endX) { height($0, z) }, outward: [0, 0, -1])
+            skirt((0..<rows).map { $0 * columns + columns - 1 },
+                  depth: error(from: z, to: endZ) { height(endX, $0) }, outward: [1, 0, 0])
+            skirt(Array(((rows - 1) * columns..<(rows * columns)).reversed()),
+                  depth: error(from: x, to: endX) { height($0, endZ) }, outward: [0, 0, 1])
+            skirt((0..<rows).reversed().map { $0 * columns },
+                  depth: error(from: z, to: endZ) { height(x, $0) }, outward: [-1, 0, 0])
         }
         var mesh = MeshDescriptor(name: "Imported terrain")
         mesh.positions = MeshBuffers.Positions(positions)

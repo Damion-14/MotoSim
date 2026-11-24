@@ -68,30 +68,42 @@ final class MotorcycleTests: XCTestCase {
         XCTAssertLessThan(abs(bike.state.riderLateralWeight), 0.03)
     }
 
-    func testLeavingTerrainRewindsToARecentUprightPoint() throws {
+    func testLeavingTerrainRecoversNearTheCrashWithRoomBeforeTheEdge() throws {
         let heightField = HeightField(columns: 2, rows: 2, width: 30, length: 50,
                                       elevationRange: 0, samples: [0, 0, 0, 0])
         var track = Track(name: "Recovery Course", heightField: heightField)
         track.startHeading = 0.1
         var bike = Motorcycle(track: track)
-        var positions = [bike.state.position]
-        var crashFrame: Int?
-        for frame in 1...720 {
+        var crashed = false
+        for _ in 0..<720 {
             if bike.advance(1 / 120, input: RideInput(throttle: 1)) {
-                crashFrame = frame
+                crashed = true
                 break
             }
-            positions.append(bike.state.position)
         }
-        let frame = try XCTUnwrap(crashFrame)
-        XCTAssertGreaterThan(frame, 240)
-        let beforeCrash = positions[max(0, frame - 240)]
-        XCTAssertEqual(bike.state.position.z, beforeCrash.z, accuracy: 1.0)
-        XCTAssertGreaterThan(bike.state.position.z, 1)
+        XCTAssertTrue(crashed)
+        XCTAssertGreaterThan(bike.state.position.z, 21)
+        XCTAssertLessThan(bike.state.position.z, 23.5)
         XCTAssertEqual(bike.state.heading, track.startHeading, accuracy: 0.03)
         XCTAssertEqual(bike.state.velocity, .zero)
         XCTAssertEqual(bike.pose.position, bike.state.position)
         XCTAssertEqual(bike.state.contacts, 2)
+    }
+
+    func testManualResetUsesTheLatestCheckpointEvenDuringTheFirstSecond() {
+        let field = HeightField(columns: 2, rows: 2, width: 50, length: 100,
+                                elevationRange: 0, samples: [0, 0, 0, 0])
+        var bike = Motorcycle(track: Track(name: "Reset Course", heightField: field))
+        for _ in 0..<108 { bike.advance(1 / 120, input: RideInput(throttle: 1)) }
+        let beforeReset = bike.state.position
+        XCTAssertGreaterThan(beforeReset.z, 1)
+        bike.reset()
+        XCTAssertEqual(bike.state.position.z, beforeReset.z, accuracy: 0.1)
+        XCTAssertEqual(bike.state.velocity, .zero)
+
+        let checkpoint = bike.state.position
+        bike.reset()
+        XCTAssertEqual(bike.state.position, checkpoint)
     }
 
     func testFixedStepsAgreeAcrossFrameRates() {

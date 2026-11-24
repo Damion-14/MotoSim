@@ -6,3 +6,4 @@ xcuserdata/
 
 backend/.env
 backend/tracks/
+/Config/Debug.local.xcconfig

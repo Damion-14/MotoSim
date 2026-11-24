@@ -19,7 +19,7 @@ import (
 const (
 	reconnectGrace = 30 * time.Second
 	wireVersion    = 1
-	trackVersion   = 1
+	trackVersion   = 2
 	maxRooms       = 128
 )
 
@@ -450,7 +450,7 @@ func writeRoomEvent(ctx context.Context, conn *websocket.Conn, event roomEvent) 
 }
 
 func (s server) validRoomTrack(track *roomTrack) bool {
-	if track == nil || track.Version != trackVersion || track.Name == "" || len(track.Name) > 400 ||
+	if track == nil || (track.Version < 1 || track.Version > trackVersion) || track.Name == "" || len(track.Name) > 400 ||
 		!bounded(track.Start, 2, 5000) || !(track.Heading > -100 && track.Heading < 100) {
 		return false
 	}

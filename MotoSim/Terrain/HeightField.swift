@@ -2,6 +2,9 @@ import Foundation
 import simd
 
 struct HeightField: Sendable {
+    // A square field of this size plus the largest artwork fits in a 64 MiB shared track.
+    static let maxImportedSamplesPerAxis = 4097
+
     let columns: Int
     let rows: Int
     let width: Float

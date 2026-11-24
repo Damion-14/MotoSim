@@ -8,6 +8,7 @@
 
 /* Begin PBXFileReference section */
 		100000000000000000000006 /* MotoSim.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = MotoSim.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000010 /* Config/Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Debug.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -29,6 +30,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000003 /* MotoSim */,
+				100000000000000000000010 /* Config/Debug.xcconfig */,
 				100000000000000000000004 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -135,16 +137,17 @@
 		};
 		10000000000000000000000E /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 100000000000000000000010 /* Config/Debug.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 356N8W782U;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "MotoSim-Info.plist";
-				MOTOSIM_SERVER_URL = "https://motosim.damedoll.com";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				MARKETING_VERSION = 0.1.0;
+				MOTOSIM_SERVER_URL = "https://motosim.damedoll.com";
 				PRODUCT_BUNDLE_IDENTIFIER = com.motosim.MotoSim;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				TARGETED_DEVICE_FAMILY = 1;
@@ -159,10 +162,11 @@
 				DEVELOPMENT_TEAM = 356N8W782U;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "MotoSim-Info.plist";
-				MOTOSIM_SERVER_URL = "https://motosim.damedoll.com";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				MARKETING_VERSION = 0.1.0;
+				MOTOSIM_HOST_UPLOAD_KEY = "";
+				MOTOSIM_SERVER_URL = "https://motosim.damedoll.com";
 				PRODUCT_BUNDLE_IDENTIFIER = com.motosim.MotoSim;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				TARGETED_DEVICE_FAMILY = 1;

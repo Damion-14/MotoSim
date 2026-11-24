@@ -6,6 +6,7 @@ struct RideView: View {
     private struct StartSelection: Identifiable {
         let id = UUID()
         let track: Track
+        var savesTrack = false
     }
 
     @Environment(\.scenePhase) private var phase
@@ -13,12 +14,18 @@ struct RideView: View {
     @StateObject private var freeRide = FreeRideSession()
     @State private var loadAttempt = 0
     @State private var pickingTrack = false
-    @State private var importing = false
+    @State private var importProgress: MXTrackImporter.Progress?
+    @State private var checkedSavedTrack = false
+    @State private var savedTrackName: String?
+    @State private var ridingSavedTrack = false
+    @State private var workingWithSavedTrack = false
     @State private var startSelection: StartSelection?
     @State private var importError: String?
     @State private var tiltEnabled = false
     @State private var showingSetup = false
+    @AppStorage("ride.physicsMode") private var physicsMode = RidePhysicsMode.simulation
     @AppStorage("ride.tireDebug") private var showTireDebug = false
+    @AppStorage("ride.performanceDebug") private var showPerformanceDebug = false
     @AppStorage("ride.maximumLeanDegrees") private var maximumLeanDegrees = 48.0
     @AppStorage("ride.tireGrip") private var tireGrip = 1.0
     @AppStorage("ride.forkRebound") private var forkRebound = 1.0
@@ -40,11 +47,36 @@ struct RideView: View {
             game.freeRide = freeRide
             freeRide.currentTrack = { [weak game] in game?.track ?? Track() }
         }
-        .task(id: loadAttempt) { await game.loadTrack() }
+        .task(id: loadAttempt) {
+            if !checkedSavedTrack {
+                do {
+                    let track = try await readSavedTrack()
+                    guard !Task.isCancelled else { return }
+                    if let track {
+                        savedTrackName = track.name
+                        ridingSavedTrack = true
+                        game.selectTrack(track)
+                    }
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    importError = "The saved track couldn’t be opened. MotoSim Circuit will load instead."
+                }
+                checkedSavedTrack = true
+            }
+            await game.loadTrack()
+        }
         .ignoresSafeArea()
         .overlay {
-            if importing {
-                ProgressView("Reading track files…")
+            if workingWithSavedTrack {
+                ProgressView("Preparing saved track…")
+                    .tint(.orange)
+                    .padding(20)
+                    .background(.black.opacity(0.85), in: .rect(cornerRadius: 12))
+            } else if let importProgress {
+                ProgressView(importLabel(importProgress), value: importProgress.fraction, total: 1)
+                    .progressViewStyle(.linear)
+                    .tint(.orange)
+                    .frame(width: 260)
                     .padding(20)
                     .background(.black.opacity(0.85), in: .rect(cornerRadius: 12))
             } else if game.startup == .ready {
@@ -59,7 +91,12 @@ struct RideView: View {
         }
         .sheet(item: $startSelection) { selection in
             TrackStartView(track: selection.track) { track in
-                if freeRide.phase == .idle { switchTrack(track) }
+                guard freeRide.phase == .idle else { return }
+                if selection.savesTrack {
+                    saveAndRide(track)
+                } else {
+                    switchTrack(track)
+                }
             }
         }
         .sheet(isPresented: $freeRide.showLobby) {
@@ -79,10 +116,14 @@ struct RideView: View {
             }
         }
         .sheet(isPresented: $showingSetup) {
-            RideSetupView(tuning: Binding(get: { tuning }, set: { updateTuning($0) }), showTireDebug: $showTireDebug, touchdownCSV: game.touchdownCSV)
+            RideSetupView(tuning: Binding(get: { tuning }, set: { updateTuning($0) }),
+                          physicsMode: $physicsMode, showTireDebug: $showTireDebug,
+                          showPerformanceDebug: $showPerformanceDebug, touchdownCSV: game.touchdownCSV)
         }
         .onChange(of: showTireDebug, initial: true) { _, enabled in game.setTireDebug(enabled) }
+        .onChange(of: showPerformanceDebug, initial: true) { _, enabled in game.setPerformanceDebug(enabled) }
         .onChange(of: tuning, initial: true) { _, value in game.applyTuning(value) }
+        .onChange(of: physicsMode, initial: true) { _, mode in game.applyPhysicsMode(mode) }
         .alert("Track Import", isPresented: Binding(
             get: { importError != nil },
             set: { if !$0 { importError = nil } }
@@ -91,7 +132,7 @@ struct RideView: View {
         } message: {
             Text(importError ?? "")
         }
-        .onChange(of: pickingTrack || importing || startSelection != nil || showingSetup || freeRide.showLobby) { _, busy in
+        .onChange(of: pickingTrack || importProgress != nil || workingWithSavedTrack || startSelection != nil || showingSetup || freeRide.showLobby) { _, busy in
             game.showingMenu = busy
             if busy { game.controls.releaseTouch() }
         }
@@ -122,8 +163,12 @@ struct RideView: View {
                     Button("Free Ride…") { freeRide.showLobby = true }
                     Button("Import MX Bikes Track…") { pickingTrack = true }
                         .disabled(freeRide.phase != .idle)
+                    if let savedTrackName, !ridingSavedTrack {
+                        Button("Ride \(savedTrackName)") { rideSavedTrack() }
+                            .disabled(freeRide.phase != .idle)
+                    }
                     Button("Change Start Point") {
-                        startSelection = StartSelection(track: game.track)
+                        startSelection = StartSelection(track: game.track, savesTrack: ridingSavedTrack)
                     }
                     .disabled(freeRide.phase != .idle)
                     if game.track.heightField != nil {
@@ -159,6 +204,17 @@ struct RideView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.black.opacity(0.72))
+
+            if let performance = game.performanceDebug {
+                HStack {
+                    Text("\(performance.fps) FPS  ·  Ping \(pingLabel(performance))")
+                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                        .padding(8)
+                        .background(.black.opacity(0.82), in: .rect(cornerRadius: 8))
+                    Spacer()
+                }
+                .allowsHitTesting(false)
+            }
 
             if let debug = game.tireDebug {
                 HStack {
@@ -204,6 +260,11 @@ struct RideView: View {
         .padding(.vertical, 10)
     }
 
+    private func pingLabel(_ readout: GameScene.PerformanceReadout) -> String {
+        if let milliseconds = readout.latencyMS { return "\(milliseconds) ms" }
+        return readout.online ? "—" : "offline"
+    }
+
     private var tuning: RideTuning {
         RideTuning(maximumLeanDegrees: maximumLeanDegrees, tireGrip: tireGrip,
                    forkRebound: forkRebound, shockRebound: shockRebound,
@@ -224,31 +285,89 @@ struct RideView: View {
         shockPreload = value.shockPreload
     }
 
-    private func switchTrack(_ track: Track) {
+    private func switchTrack(_ track: Track, saved: Bool = false) {
+        ridingSavedTrack = saved
         game.selectTrack(track)
         loadAttempt += 1
+    }
+
+    private func readSavedTrack() async throws -> Track? {
+        try await Task.detached(priority: .userInitiated) {
+            try SavedImportedTrack.load(from: SavedImportedTrack.location)
+        }.value
+    }
+
+    private func rideSavedTrack() {
+        workingWithSavedTrack = true
+        Task {
+            defer { workingWithSavedTrack = false }
+            do {
+                if let track = try await readSavedTrack() {
+                    switchTrack(track, saved: true)
+                    return
+                }
+            } catch {
+                importError = error.localizedDescription
+            }
+            savedTrackName = nil
+        }
+    }
+
+    private func saveAndRide(_ track: Track) {
+        workingWithSavedTrack = true
+        Task {
+            defer { workingWithSavedTrack = false }
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try SavedImportedTrack.save(track, to: SavedImportedTrack.location)
+                }.value
+                savedTrackName = track.name
+                switchTrack(track, saved: true)
+            } catch {
+                switchTrack(track)
+                importError = "The track couldn’t be saved for the next launch. \(error.localizedDescription)"
+            }
+        }
     }
 
     private func importTrack(_ result: Result<URL, Error>) {
         guard freeRide.phase == .idle else { return }
         do {
             let trackURL = try result.get()
-            importing = true
+            importProgress = .opening
+            let (updates, reporting) = AsyncStream<MXTrackImporter.Progress>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            let worker = Task.detached(priority: .userInitiated) {
+                let hasAccess = trackURL.startAccessingSecurityScopedResource()
+                defer {
+                    reporting.finish()
+                    if hasAccess { trackURL.stopAccessingSecurityScopedResource() }
+                }
+                return try MXTrackImporter.load(file: trackURL) { reporting.yield($0) }
+            }
             Task {
-                defer { importing = false }
+                defer { importProgress = nil }
+                for await update in updates {
+                    importProgress = update
+                }
                 do {
-                    let track = try await Task.detached(priority: .userInitiated) {
-                        let hasAccess = trackURL.startAccessingSecurityScopedResource()
-                        defer { if hasAccess { trackURL.stopAccessingSecurityScopedResource() } }
-                        return try MXTrackImporter.load(file: trackURL)
-                    }.value
-                    if freeRide.phase == .idle { startSelection = StartSelection(track: track) }
+                    let track = try await worker.value
+                    if freeRide.phase == .idle { startSelection = StartSelection(track: track, savesTrack: true) }
                 } catch {
                     if freeRide.phase == .idle { importError = error.localizedDescription }
                 }
             }
         } catch {
             importError = error.localizedDescription
+        }
+    }
+
+    private func importLabel(_ progress: MXTrackImporter.Progress) -> LocalizedStringKey {
+        switch progress {
+        case .opening: "Opening track files…"
+        case .terrain: "Reading terrain…"
+        case .extracting: "Extracting track artwork…"
+        case .textures: "Processing textures and grass…"
+        case .complete: "Import complete"
         }
     }
 

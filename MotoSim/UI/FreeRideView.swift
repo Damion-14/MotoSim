@@ -5,10 +5,10 @@ struct FreeRideView: View {
     let track: Track
     @AppStorage("online.trackServer") private var serverAddress = TrackTransfer.defaultServerAddress
     @AppStorage("online.riderName") private var riderName = ""
-    @State private var uploadKey = ""
     @State private var joinCode = ""
 
-    private var validServer: Bool { TrackTransfer.serverURL(serverAddress) != nil }
+    private var server: URL? { TrackTransfer.serverURL(serverAddress) }
+    private var canHostCustomTrack: Bool { server.map { TrackTransfer.canUpload(to: $0) } ?? false }
     private var normalizedCode: String { joinCode.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     var body: some View {
@@ -30,17 +30,14 @@ struct FreeRideView: View {
                     }
                     Section("Host") {
                         LabeledContent("Track", value: track.name)
-                        if track.heightField != nil {
-                            SecureField("Host upload key", text: $uploadKey)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
+                        if track.heightField != nil && !canHostCustomTrack {
+                            Text("Custom-track hosting requires a configured test build and its default server.")
+                                .foregroundStyle(.secondary)
                         }
                         Button("Host Free Ride") {
-                            session.host(track: track, serverAddress: serverAddress,
-                                         uploadKey: uploadKey.trimmingCharacters(in: .whitespacesAndNewlines),
-                                         name: riderName)
+                            session.host(track: track, serverAddress: serverAddress, name: riderName)
                         }
-                        .disabled(!validServer || (track.heightField != nil && uploadKey.utf8.count < 32))
+                        .disabled(server == nil || (track.heightField != nil && !canHostCustomTrack))
                     }
                     Section("Join") {
                         TextField("8-character room code", text: $joinCode)
@@ -50,7 +47,7 @@ struct FreeRideView: View {
                         Button("Join Free Ride") {
                             session.join(code: normalizedCode, serverAddress: serverAddress, name: riderName)
                         }
-                        .disabled(!validServer || !FreeRideSession.validCode(normalizedCode))
+                        .disabled(server == nil || !FreeRideSession.validCode(normalizedCode))
                     }
                 case .preparing, .connecting:
                     ProgressView(session.phase == .preparing ? "Uploading track…" : "Connecting to Free Ride…")

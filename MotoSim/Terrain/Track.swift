@@ -8,6 +8,8 @@ struct Track: Sendable {
     var name = "MotoSim Circuit"
     var heightField: HeightField?
     var groundArt: TrackGroundArt?
+    var grass: TrackGrass?
+    var courseLine: [SIMD2<Float>] = []
     var startPosition = Track.spawn
     var startHeading = Track.spawnHeading
 
@@ -53,18 +55,6 @@ struct Track: Sendable {
         let d: Float = 0.08
         return simd_normalize([height(x - d, z) - height(x + d, z),
                                2 * d, height(x, z - d) - height(x, z + d)])
-    }
-
-    func minimumCameraHeight(from camera: SIMD3<Float>, lookingAt focus: SIMD3<Float>) -> Float {
-        var required = height(camera.x, camera.z) + 0.85
-        for sample in 1..<12 {
-            let t = Float(sample) / 12
-            let point = camera + (focus - camera) * t
-            let clearance = 0.55 * (1 - t) + 0.12
-            let ground = height(point.x, point.z) + clearance
-            required = max(required, (ground - t * focus.y) / (1 - t))
-        }
-        return required
     }
 
     func tireSurface(_ x: Float, _ z: Float) -> TireSurface {

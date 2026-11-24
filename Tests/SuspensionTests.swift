@@ -48,11 +48,15 @@ final class SuspensionTests: XCTestCase {
             XCTAssertEqual(trace.samples.first?.load, .zero)
             XCTAssertFalse(trace.isRecording)
             XCTAssertTrue(trace.csv.hasPrefix("time_s,front_travel_mm"))
+            let rows = trace.csv.split(separator: "\n")
+            XCTAssertTrue(rows[0].contains("front_patch_side_speed_m_s"))
+            XCTAssertTrue(rows.allSatisfy { $0.split(separator: ",").count == 21 })
             let peaks = SIMD2(impact.map(\.travel.x).max()!, impact.map(\.travel.y).max()!)
             let frontContact = impact.filter { $0.load.x > 0 }.count
             let rearContact = impact.filter { $0.load.y > 0 }.count
-            XCTAssertGreaterThan(peaks.x, 0.10)
-            XCTAssertGreaterThan(peaks.y, 0.16)
+            let sag = Motorcycle(track: bike.track).state.compression
+            XCTAssertGreaterThan(peaks.x, sag.x + 0.02)
+            XCTAssertGreaterThan(peaks.y, sag.y + 0.02)
             XCTAssertLessThanOrEqual(peaks.x, bike.configuration.fork.travel)
             XCTAssertLessThanOrEqual(peaks.y, bike.configuration.shock.travel)
             XCTAssertGreaterThan(frontContact, 140)
@@ -63,6 +67,59 @@ final class SuspensionTests: XCTestCase {
             XCTAssertLessThan(abs(bike.state.suspensionSpeed.x), 0.05)
             XCTAssertLessThan(abs(bike.state.suspensionSpeed.y), 0.05)
             XCTAssertLessThan(abs(bike.state.pitchRate), 0.05)
+        }
+    }
+
+    func testHardRollingLandingDoesNotLaunchBikeBackIntoAir() throws {
+        for slope: Float in [0, -0.15] {
+            let bike = drop(slope: slope, height: 2.2, forwardSpeed: 6)
+            let trace = bike.suspensionTrace
+            let touchdown = try XCTUnwrap(trace.touchdownStep)
+            let landing = trace.samples.filter { $0.step >= touchdown }
+            XCTAssertEqual(landing.count, 181)
+            XCTAssertTrue(landing.allSatisfy { $0.load != .zero })
+            // Allow the chassis to rise as the suspension returns toward sag.
+            XCTAssertLessThan(landing.map(\.chassisVerticalSpeed).max()!, 1.15)
+            XCTAssertEqual(bike.bottomOutCount, .zero)
+        }
+    }
+
+    func testExtremeLandingsKeepContactAndSettle() throws {
+        let scenarios: [(height: Float, slope: Float, speed: Float, pitch: Float)] = [
+            (3, 0, 10, 0),
+            (4, 0, 0, 0),
+            (4, 0, 12, -0.12),
+            (4, 0, 12, 0.12),
+            (5, 0, 12, 0),
+            (5, -0.20, 16, 0)
+        ]
+        for scenario in scenarios {
+            let context = "Drop \(scenario.height) m, slope \(scenario.slope), speed \(scenario.speed) m/s, pitch \(scenario.pitch) rad"
+            var touchedDown = false
+            var airborneSteps = 0
+            let bike = drop(slope: scenario.slope, height: scenario.height, forwardSpeed: scenario.speed,
+                            pitchOffset: scenario.pitch) { state in
+                if state.contacts > 0 { touchedDown = true }
+                if touchedDown && state.contacts == 0 { airborneSteps += 1 }
+            }
+            XCTAssertTrue(touchedDown, context)
+            XCTAssertEqual(airborneSteps, 0, context)
+            XCTAssertEqual(bike.bottomOutCount, .zero, context)
+
+            let trace = bike.suspensionTrace
+            let touchdown = try XCTUnwrap(trace.touchdownStep, context)
+            let landing = trace.samples.filter { $0.step >= touchdown }
+            XCTAssertEqual(landing.count, 181, context)
+            let normal = bike.track.normal(bike.state.position.x, bike.state.position.z)
+            let reboundSpeed = landing.map {
+                simd_dot(SIMD3($0.velocityX, $0.chassisVerticalSpeed, $0.velocityZ), normal)
+            }
+            let impactSpeed = try XCTUnwrap(reboundSpeed.first, context)
+            let peakRebound = try XCTUnwrap(reboundSpeed.max(), context)
+            XCTAssertLessThan(impactSpeed, -7, context)
+            XCTAssertLessThan(peakRebound, -0.20 * impactSpeed, context)
+            XCTAssertLessThan(reboundSpeed.suffix(61).map { abs($0) }.max() ?? .infinity, 0.25, context)
+            XCTAssertEqual(bike.state.contacts, 2, context)
         }
     }
 
@@ -125,29 +182,34 @@ final class SuspensionTests: XCTestCase {
     }
 
     func testHardLandingRecordsBottomOutOncePerEndStopVisit() {
-        let bike = drop(tuning: RideTuning(forkCompression: 0.5, shockHighSpeedCompression: 0.5), height: 2.2)
+        let bike = drop(tuning: RideTuning(forkCompression: 0.5, shockHighSpeedCompression: 0.5), height: 3.4)
         XCTAssertEqual(bike.bottomOutCount.y, 1)
         XCTAssertTrue(bike.suspensionTrace.samples.contains {
             $0.bottomOuts.y == 1 && $0.travel.y == bike.configuration.shock.travel
         })
     }
 
-    private func drop(slope: Float = 0, tuning: RideTuning = RideTuning(), height: Float = 0.45) -> Motorcycle {
+    private func drop(slope: Float = 0, tuning: RideTuning = RideTuning(), height: Float = 0.45,
+                      forwardSpeed: Float? = nil, pitchOffset: Float = 0,
+                      afterStep: (BikeState) -> Void = { _ in }) -> Motorcycle {
         let uphill: [UInt16] = slope <= 0 ? [.max, .max, 0, 0] : [0, 0, .max, .max]
-        let field = HeightField(columns: 2, rows: 2, width: 40, length: 80,
-                                elevationRange: abs(slope) * 80, samples: uphill)
+        let field = HeightField(columns: 2, rows: 2, width: 40, length: 160,
+                                elevationRange: abs(slope) * 160, samples: uphill)
         let track = Track(name: "Landing", heightField: field)
         let resting = Motorcycle(track: track, tuning: tuning)
         var initial = resting.state
         initial.position.y += height
-        initial.velocity = slope == 0 ? .zero : [0, slope * 6, 6]
+        initial.pitch += pitchOffset
+        let speed = forwardSpeed ?? (slope == 0 ? 0 : 6)
+        initial.velocity = [0, slope * speed, speed]
         initial.compression = .zero
         initial.contacts = 0
-        initial.wheelSpeed = slope == 0 ? .zero : [6 / resting.configuration.frontRadius, 6 / resting.configuration.rearRadius]
+        initial.wheelSpeed = [speed / resting.configuration.frontRadius, speed / resting.configuration.rearRadius]
         var bike = Motorcycle(track: track, tuning: tuning, initialState: initial)
         bike.collectsTireTrace = true
         for _ in 0..<480 {
             XCTAssertFalse(bike.advance(Motorcycle.stepSeconds, input: RideInput()))
+            afterStep(bike.state)
         }
         return bike
     }

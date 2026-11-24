@@ -2,6 +2,16 @@ import XCTest
 @testable import MotoSimPhysics
 
 final class TireSurfaceTests: XCTestCase {
+    func testTorqueAssistReservesGripForCornering() {
+        let straight = DirtTire.assistedTorqueLimit(radius: 0.34, gripLimit: 850, slipAngle: 0,
+                                                    camber: 0, surface: .trackDirt)
+        let turning = DirtTire.assistedTorqueLimit(radius: 0.34, gripLimit: 850, slipAngle: 0.12,
+                                                   camber: 0, surface: .trackDirt)
+        XCTAssertGreaterThan(turning.torque, 0)
+        XCTAssertLessThan(turning.torque, straight.torque)
+        XCTAssertLessThan(turning.slip, straight.slip)
+    }
+
     func testDryGrassResistsSideSlipWhileAllowingLockedWheelSkids() {
         let grass = Track().tireSurface(0, 0)
         let rollingSideSlip = DirtTire.force(slip: 0, slipAngle: 0.04, camber: 0, load: 850, surface: grass)

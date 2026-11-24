@@ -25,7 +25,7 @@ final class FreeRideTests: XCTestCase {
         XCTAssertNotEqual(try SharedTrack.hash(SharedTrack.encode(different)), SharedTrack.hash(data))
         XCTAssertThrowsError(try SharedTrack.decode(data.dropLast(), name: "Broken"))
         var wrongVersion = data
-        wrongVersion[4] = 2
+        wrongVersion[4] = 3
         XCTAssertThrowsError(try SharedTrack.decode(wrongVersion, name: "Different version"))
     }
 

@@ -88,6 +88,8 @@ final class FreeRideSession: ObservableObject {
     private var generation: UInt32 = 0
     private var nextSendAt: TimeInterval = 0
     private var movementTask: Task<Void, Never>?
+    private var lastPingAt: TimeInterval?
+    private var pingSample: (time: TimeInterval, milliseconds: Int)?
 
     var canStart: Bool {
         connected && isHost && phase == .lobby && riders.count >= 2 && riders.allSatisfy { $0.status == .ready }
@@ -100,7 +102,7 @@ final class FreeRideSession: ObservableObject {
         code.utf8.count == 8 && code.uppercased().utf8.allSatisfy { (48...57).contains($0) || (65...70).contains($0) }
     }
 
-    func host(track: Track, serverAddress: String, uploadKey: String, name: String) {
+    func host(track: Track, serverAddress: String, name: String) {
         guard phase == .idle, let server = TrackTransfer.serverURL(serverAddress) else { return }
         notice = nil
         isHost = true
@@ -112,7 +114,7 @@ final class FreeRideSession: ObservableObject {
             do {
                 var download: TrackDownload?
                 if track.heightField != nil {
-                    download = try await TrackTransfer.upload(track, server: server, key: uploadKey)
+                    download = try await TrackTransfer.upload(track, server: server)
                 }
                 try Task.checkCancellation()
                 guard sessionID == id else { return }
@@ -195,6 +197,24 @@ final class FreeRideSession: ObservableObject {
         phase == .riding ? motions.compactMapValues { $0.pose(at: time) } : [:]
     }
 
+    func sampleLatency(at time: TimeInterval) -> Int? {
+        guard connected, let socket else { return nil }
+        if lastPingAt.map({ time - $0 >= (pingSample == nil ? 5 : 2) }) ?? true {
+            lastPingAt = time
+            let sentAt = ProcessInfo.processInfo.systemUptime
+            socket.sendPing { [weak self, weak socket] error in
+                let receivedAt = ProcessInfo.processInfo.systemUptime
+                guard error == nil else { return }
+                Task { @MainActor in
+                    guard let self, let socket, self.socket === socket, self.lastPingAt == time else { return }
+                    self.pingSample = (receivedAt, Int(((receivedAt - sentAt) * 1000).rounded()))
+                }
+            }
+        }
+        if let pingSample, time - pingSample.time < 5 { return pingSample.milliseconds }
+        return nil
+    }
+
     private func connect(_ initial: RoomCommand, server: URL) {
         guard var address = URLComponents(url: server.appending(path: "v1/rooms/connect"), resolvingAgainstBaseURL: false) else { return }
         address.scheme = "wss"
@@ -236,6 +256,8 @@ final class FreeRideSession: ObservableObject {
                     guard !Task.isCancelled, sessionID == id else { return }
                     connection.cancel(with: .goingAway, reason: nil)
                     socket = nil
+                    lastPingAt = nil
+                    pingSample = nil
                     movementTask?.cancel()
                     movementTask = nil
                     connected = false
@@ -262,7 +284,7 @@ final class FreeRideSession: ObservableObject {
         switch event.type {
         case "welcome":
             guard let id = event.id, let code = event.code, let token = event.token, let info = event.track,
-                  info.version == SharedTrack.version else {
+                  SharedTrack.supportsVersion(info.version) else {
                 finish(reason: "This Free Ride uses an incompatible track format.")
                 return
             }
@@ -358,6 +380,8 @@ final class FreeRideSession: ObservableObject {
         sessionID = UUID()
         socket?.cancel(with: .normalClosure, reason: nil)
         socket = nil
+        lastPingAt = nil
+        pingSample = nil
         connectionTask?.cancel()
         connectionTask = nil
         transfer?.cancel()
